@@ -1,0 +1,4 @@
+vllm==0.32.0
+ray[default]==2.59.0
+# CUDA 13 compiler/runtime headers for JIT; math libraries come from PyTorch.
+cuda-toolkit[nvcc,crt,cccl,nvvm,cudart]==13.0.3
