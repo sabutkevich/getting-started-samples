@@ -7,7 +7,7 @@ from pathlib import Path
 
 RAY_VERSION = "2.59.0"
 BASE_IMAGE = "cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42"
-SOURCE_FILES = ("cluster_common.py", "bootstrap_ray.py", "ray_node.py", "smoke_test.py", "requirements-ray.txt")
+SOURCE_FILES = ("topology.py", "cluster_common.py", "bootstrap_ray.py", "ray_node.py", "smoke_test.py", "requirements-ray.txt")
 
 
 def atomic_json(path, value):
@@ -45,42 +45,41 @@ def pod_ipv4():
 
 
 def job_plan(config):
-    nodes = config["nodes"]
-    if len(nodes) != 2 or len(set(nodes)) != 2 or not all(nodes):
-        raise ValueError("Exactly two DIFFERENT physical nodes are required")
+    if type(config.get("num_nodes", 2)) is not int or config.get("num_nodes", 2) <= 0:
+        raise ValueError("num_nodes must be a positive integer")
     gpus = config["gpus_per_node"]
     if not isinstance(gpus, int) or not 1 <= gpus <= 8:
         raise ValueError("gpus_per_node must be an integer from 1 to 8")
     if config["cpus_per_node"] < gpus:
-        raise ValueError("Need at least one Ray CPU per GPU actor")
-    if config["placement"] not in ("pinned", "single-job"):
-        raise ValueError("placement must be pinned or single-job")
-    common = {
-        "region": "SR009", "base_image": config["image"],
-        "instance_type": f"h200.{gpus}gpu.{12*gpus}C.{244*gpus}G",
-        "type": "binary", "processes_per_worker": 1, "internet": True,
-    }
-    if config["placement"] == "pinned":
-        return [dict(common, n_workers=1, include_nodes=[node]) for node in nodes]
-    return [dict(common, n_workers=2, include_nodes=nodes)]
+        raise ValueError("Need at least one CPU per GPU")
+    requests = [{"region": config.get("region", "SR009"), "base_image": config["image"],
+             "instance_type": f"h200.{gpus}gpu.{12*gpus}C.{244*gpus}G",
+             "type": "binary", "processes_per_worker": 1, "internet": True,
+             "n_workers": config.get("num_nodes", 2)}]
+    for name in ("allocation_name", "queue_name"):
+        if config.get(name):
+            requests[0][name] = config[name]
+    return requests
 
 
-def resolve_rank(value, environ=None):
+def resolve_rank(value, environ=None, num_nodes=None):
     if value != "auto":
         rank = int(value)
     else:
         environ = os.environ if environ is None else environ
         raw = environ.get("OMPI_COMM_WORLD_RANK", environ.get("RANK"))
+        if raw is None and num_nodes == 1:
+            raw = "0"
         if raw is None:
             raise RuntimeError("binary launcher did not supply OMPI_COMM_WORLD_RANK or RANK")
         rank = int(raw)
-    if rank not in (0, 1):
-        raise ValueError(f"Expected node rank 0 or 1, got {rank}")
+    if rank < 0 or (num_nodes is not None and rank >= num_nodes):
+        raise ValueError(f"Node rank {rank} is outside the configured worker count {num_nodes}")
     return rank
 
 
 def nccl_bus_bandwidth(size_bytes, iterations, elapsed_seconds, world_size):
-    if elapsed_seconds <= 0 or world_size < 2:
+    if elapsed_seconds <= 0 or world_size < 1:
         raise ValueError("Invalid AllReduce measurement")
     algbw = size_bytes * iterations / elapsed_seconds / 1e9
     return algbw * 2 * (world_size - 1) / world_size

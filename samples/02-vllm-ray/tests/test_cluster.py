@@ -12,25 +12,26 @@ from submit_ray import arguments, prepare, request_stop
 
 class ClusterTests(unittest.TestCase):
     def config(self, **changes):
-        config = {"id": "abc123", "image": BASE_IMAGE, "nodes": ["node-a", "node-b"],
-                  "gpus_per_node": 1, "cpus_per_node": 12, "placement": "pinned",
+        config = {"id": "abc123", "image": BASE_IMAGE, "num_nodes": 2,
+                  "gpus_per_node": 1, "cpus_per_node": 12, 
                   "object_store_bytes": 1024**3}
         config.update(changes)
         return config
 
-    def test_one_gpu_jobs_cannot_pack_onto_one_allowed_node(self):
+    def test_job_uses_two_automatically_placed_workers(self):
         jobs = job_plan(self.config())
-        self.assertEqual(len(jobs), 2)
-        self.assertEqual([job["include_nodes"] for job in jobs], [["node-a"], ["node-b"]])
-        self.assertTrue(all(job["n_workers"] == job["processes_per_worker"] == 1 for job in jobs))
+        self.assertEqual(len(jobs), 1)
+        self.assertTrue(all("include_nodes" not in job for job in jobs))
+        self.assertTrue(all(job["n_workers"] == 2 and job["processes_per_worker"] == 1 for job in jobs))
         self.assertTrue(all(job["instance_type"] == "h200.1gpu.12C.244G" for job in jobs))
+        self.assertEqual(job_plan(self.config(num_nodes=3))[0]["n_workers"], 3)
         with self.assertRaises(ValueError):
-            job_plan(self.config(nodes=["node-a", "node-a"]))
+            job_plan(self.config(num_nodes=0))
 
     def test_full_node_configuration_requires_explicit_gpu_request(self):
         jobs = job_plan(self.config(gpus_per_node=8, cpus_per_node=96))
         self.assertTrue(all(job["instance_type"] == "h200.8gpu.96C.1952G" for job in jobs))
-        self.assertEqual(len(jobs), 2)
+        self.assertEqual(len(jobs), 1)
 
     def test_binary_mpi_rank_takes_precedence_over_stale_torch_rank(self):
         self.assertEqual(resolve_rank("auto", {"OMPI_COMM_WORLD_RANK": "1", "RANK": "0"}), 1)
@@ -59,7 +60,7 @@ class ClusterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="cloud ray test ") as temp:
             args = arguments(["--nfs-root", temp, "--prepare-only"])
             run, jobs = prepare(args)
-            self.assertEqual(len(jobs), 2)
+            self.assertEqual(len(jobs), 1)
             config = read_json(run / "run.json")
             self.assertEqual(config["keep_seconds"], 0)
             self.assertEqual(config["image"], BASE_IMAGE)
@@ -70,13 +71,13 @@ class ClusterTests(unittest.TestCase):
                 parts = shlex.split(command)
                 self.assertEqual(parts[:3], ["exec", "python", "-u"])
                 self.assertEqual(Path(parts[3]), run / "bootstrap_ray.py")
-                self.assertEqual(parts[-1], str(rank))
+                self.assertEqual(parts[-1], "auto")
             request_stop(run)
             self.assertTrue((run / "STOP").exists())
 
     def test_single_job_has_auto_rank_and_two_workers(self):
         with tempfile.TemporaryDirectory() as temp:
-            args = arguments(["--nfs-root", temp, "--prepare-only", "--placement", "single-job"])
+            args = arguments(["--nfs-root", temp, "--prepare-only"])
             run, jobs = prepare(args)
             self.assertEqual(len(jobs), 1)
             self.assertEqual(jobs[0]["n_workers"], 2)

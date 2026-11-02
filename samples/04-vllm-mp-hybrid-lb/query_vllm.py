@@ -12,7 +12,7 @@ from vllm_common import api_request
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True, type=Path)
-    parser.add_argument("--node", type=int, choices=(0, 1), default=0, help="Hybrid LB API node")
+    parser.add_argument("--node", type=int, default=0, help="Hybrid LB API node")
     parser.add_argument("--prompt", default="Briefly explain tensor parallelism.")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--timeout", type=int, default=300)
@@ -23,9 +23,13 @@ def main(argv=None):
         parser.error("READY.json is missing; wait for the first successful model response")
     if (args.run_dir / "STOP").exists() or time.time() >= ready["expires_at"]:
         parser.error("This service has stopped or its lease has expired")
+    nodes = ready.get("endpoint_nodes", list(range(len(ready["endpoints"]))))
+    if args.node not in nodes:
+        parser.error(f"Node {args.node} has no API; available API node ranks: {nodes}")
+    endpoint = ready["endpoints"][nodes.index(args.node)]
     key = (args.run_dir / "api-key").read_text().strip()
     try:
-        result = api_request(ready["endpoints"][args.node], "/v1/chat/completions", key, {
+        result = api_request(endpoint, "/v1/chat/completions", key, {
             "model": ready["model"], "messages": [{"role": "user", "content": args.prompt}],
             "max_tokens": args.max_tokens, "temperature": 0.2,
             "chat_template_kwargs": {"thinking": args.thinking},

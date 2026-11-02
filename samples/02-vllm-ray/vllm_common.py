@@ -1,4 +1,6 @@
 """Model, command and HTTP helpers; safe to import in the management Jupyter."""
+from topology import resolved_topology, validate_geometry
+
 import hashlib
 import json
 import os
@@ -82,29 +84,29 @@ def inspect_model(directory):
 
 
 def validate_topology(config, manifest):
-    tp, dp, pp = (config[key] for key in ("tensor_parallel_size", "data_parallel_size", "pipeline_parallel_size"))
-    if (tp, dp, pp) != (8, 2, 1) or not config["enable_expert_parallel"]:
-        raise ValueError("This launcher requires TP=8, DP=2, EP=16, PP=1")
-    for key, divisor in (("o_groups", tp), ("num_attention_heads", tp), ("n_routed_experts", tp * dp)):
-        value = manifest["text_geometry"].get(key)
-        if not isinstance(value, int) or value < divisor or value % divisor:
-            raise ValueError(f"Checkpoint {key}={value} is incompatible with divisor {divisor}")
+    validate_geometry(manifest, config, default_tp=8)
 
 
 def distributed_environment(config, metadata, rank, inherited):
     by_rank = {entry["rank"]: entry for entry in metadata}
-    return dict(inherited, NCCL_NET="IB", NCCL_IB_DISABLE="0", NCCL_SOCKET_FAMILY="AF_INET",
+    env = dict(inherited, NCCL_NET="IB", NCCL_IB_DISABLE="0", NCCL_SOCKET_FAMILY="AF_INET",
                 GLOO_SOCKET_IFNAME=config["socket_ifname"], NCCL_SOCKET_IFNAME=config["socket_ifname"],
                 VLLM_HOST_IP=by_rank[rank]["ip"],
                 VLLM_ENGINE_READY_TIMEOUT_S=str(config["model_timeout"]),
-                VLLM_RAY_DP_PACK_STRATEGY="strict",
-                VLLM_RAY_DP_PLACEMENT_NODE_IPS=",".join(by_rank[i]["ip"] for i in (0, 1)),
-                VLLM_HUMMING_MOE_GEMM_TYPE="grouped", VLLM_USE_RUST_FRONTEND="0",
+                VLLM_RAY_DP_PACK_STRATEGY=("span" if resolved_topology(config, 8)["nodes_per_replica"] > 1 else "strict"),
+                VLLM_RAY_DP_PLACEMENT_NODE_IPS=",".join(by_rank[i]["ip"] for i in sorted(by_rank)),
+                VLLM_USE_RUST_FRONTEND="0",
                 RAY_DEDUP_LOGS="0")
+    if config.get("enable_expert_parallel", True):
+        env["VLLM_HUMMING_MOE_GEMM_TYPE"] = "grouped"
+    else:
+        env.pop("VLLM_HUMMING_MOE_GEMM_TYPE", None)
+    return env
 
 
 def server_command(config):
-    return [
+    topo = resolved_topology(config, 8)
+    command = [
         "vllm", "serve", config["model_dir"],
         "--host", "0.0.0.0", "--port", str(config["api_port"]),
         "--served-model-name", config["served_model_name"],
@@ -112,8 +114,8 @@ def server_command(config):
         "--tensor-parallel-size", str(config["tensor_parallel_size"]),
         "--pipeline-parallel-size", str(config["pipeline_parallel_size"]),
         "--data-parallel-size", str(config["data_parallel_size"]),
-        "--data-parallel-size-local", "1", "--data-parallel-backend", "ray",
-        "--enable-expert-parallel", "--all2all-backend", config["all2all_backend"],
+        "--data-parallel-size-local", str(topo["data_parallel_size_local"]), "--data-parallel-backend", "ray",
+        "--all2all-backend", config["all2all_backend"],
         "--moe-backend", "humming", "--api-server-count", "1",
         "--engram-config", '{"cpu_offload":true,"embedding_across_dp":false}',
         "--tokenizer-mode", "deepseek_v41",
@@ -127,6 +129,9 @@ def server_command(config):
         "--max-num-batched-tokens", str(config["max_batched_tokens"]),
         "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
     ]
+    if topo["enable_expert_parallel"]:
+        command.append("--enable-expert-parallel")
+    return command
 
 
 def api_request(base_url, path, key, payload=None, timeout=30):

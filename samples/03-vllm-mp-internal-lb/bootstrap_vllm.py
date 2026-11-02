@@ -76,14 +76,15 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--rank", required=True)
     args = parser.parse_args()
-    run, rank = args.run_dir, resolve_rank(args.rank)
+    run = args.run_dir
+    rank = resolve_rank(args.rank, num_nodes=read_json(run / "run.json")["num_nodes"])
     stop = run / "STOP"
     try:
         config = read_json(run / "run.json")
         atomic_json(run / f"status-{rank}.json", {"stage": "install-vllm", "updated_at": time.time()})
         if not shutil.which("c++"):
             raise RuntimeError("Base image needs a C++ compiler for CUDA JIT")
-        # Same absolute name in two separate container filesystems. vLLM may copy
+        # Same absolute name in every worker container filesystem. vLLM may copy
         # CUDA_HOME/LD_LIBRARY_PATH from the driver to remote actors.
         environment = Path("/tmp") / ("cv-" + config["id"])
         environment.mkdir(mode=0o700)

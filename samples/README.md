@@ -4,86 +4,46 @@
 
 ## English
 
-Four self-contained getting-started samples for distributed GPU workloads on **Cloud.ru SR009, two physical nodes, up to 16 NVIDIA H200 GPUs**. The inference samples serve the local **DeepSeek V4.1 Flash (1017)** checkpoint. Each directory includes its own entrypoints, pinned runtime requirements, tests and a bilingual README with all command parameters.
+Four self-contained H200/SR009 samples with configurable node counts and automatic placement without physical server names. Inference supports configurable DP, TP, PP and EP. Every directory contains its own source, requirements, tests and bilingual README.
 
-### Choose a sample
+| Sample | Purpose | API |
+| --- | --- | --- |
+| [01-ray-cluster](01-ray-cluster/README.md) | Ray: CUDA, object transfer and NCCL smoke test | none |
+| [02-vllm-ray](02-vllm-ray/README.md) | DeepSeek inference with Ray; default TP8/DP2/EP16 | one on head |
+| [03-vllm-mp-internal-lb](03-vllm-mp-internal-lb/README.md) | Native multiprocessing and internal DP balancing | one on node 0 |
+| [04-vllm-mp-hybrid-lb](04-vllm-mp-hybrid-lb/README.md) | Native multiprocessing and hybrid DP balancing | one per replica-host group |
 
-| Sample | Topology / resources | API entrypoints | What you get |
-| --- | --- | --- | --- |
-| [01 · Ray cluster](01-ray-cluster/README.md#english) | Two nodes; 1–8 H200 per node | No model API | Ray GPU scheduling, CUDA, bidirectional object transfer and NCCL AllReduce checks, with a saved report. |
-| [02 · vLLM + Ray](02-vllm-ray/README.md#english) | TP8 / DP2 / EP16 / PP1; 16 H200 | One on the head | Ray-managed inference with two DP engines behind one API; tested text-only eager preset with 16K context. |
-| [03 · vLLM multiprocessing + internal LB](03-vllm-mp-internal-lb/README.md#english) | TP1 / DP16 / EP16 / PP1; 16 H200 | One on the head | Native multiprocessing and built-in balancing across all 16 DP engines; the second node runs headless. |
-| [04 · vLLM multiprocessing + hybrid LB](04-vllm-mp-hybrid-lb/README.md#english) | TP1 / DP16 / EP16 / PP1; 16 H200 | One per node, two total | Each API balances eight local DP engines. A client or external HTTP load balancer selects the API node. |
+Run from the management Jupyter image **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**, which provides **`/usr/bin/python3.12`** and the platform `client_lib`. Copy the sample onto shared NFS, for example `/home/jovyan/samples`; absolute paths must match in Jupyter and worker containers. The run root must already exist.
 
-TP = tensor parallelism, DP = data parallelism, EP = expert parallelism, PP = pipeline parallelism. With EP enabled, experts span the TP × DP group. The two multiprocessing samples use stock vLLM without runtime source patches. Sample 04 does not include an external HTTP balancer; sample 03 provides the single-API setup.
+Workers use **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Cloud.ru selects physical hosts: one binary job with `n_workers=N` and `processes_per_worker=1`, without `include_nodes`/`exclude_nodes`. Node ranks come from MPI and addresses are discovered at launch. Resource shape: `h200.Ggpu.(12*G)C.(244*G)G`. The platform enforces available shapes, allocation limits and queue permissions. Rejected submissions fail visibly; there are no automatic submission retries.
 
-```text
-samples/
-├── README.md
-├── .gitignore
-├── 01-ray-cluster/
-├── 02-vllm-ray/
-├── 03-vllm-mp-internal-lb/
-└── 04-vllm-mp-hybrid-lb/
-```
+### Topology rules
 
-### Prerequisites
+- Each of N workers requests the same 1–8 H200 GPUs. N is any positive count accepted by the platform.
+- `DP * TP * PP = N * GPUs_per_node`. DP is calculated by default; an explicit DP must use all requested GPUs.
+- With EP enabled: `EP = TP * DP`; with EP disabled its group size is 1. vLLM 0.32.0 does not expose an independent arbitrary EP size. `--ep-size` asserts the expected result.
+- A TP*PP replica must fit uniformly within a worker or span a whole number of complete workers. Local DP is calculated automatically.
+- Topology arithmetic and available checkpoint geometry, including attention/o_groups TP divisibility, are checked before submission. Uneven expert placement is permitted without requiring experts % EP == 0.
+- Planning checks cannot guarantee GPU memory capacity or model-kernel support for every combination. Runtime remains stock, without patches. New cluster sizes and parallelism combinations need GPU validation.
 
-- Run launchers from Cloud.ru management Jupyter using the **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`** image. This Jupyter image provides **`/usr/bin/python3.12`**, the interpreter used in all commands below, and the platform-provided `client_lib`. There is no root-level dependency installation; Ray/vLLM are installed in isolated environments inside jobs.
-- Copy this repository to shared NFS, for example `/home/jovyan/samples`. NFS paths must be identical and accessible in Jupyter and job containers. The run root defaults to `/home/jovyan` and must already exist.
-- Supply two distinct available SR009 hosts through `--nodes NODE0 NODE1` if the tested defaults (`hpcsrv-201.sr009`, `hpcsrv-202.sr009`) do not match your allocation. Inference requests eight H200 GPUs on each host (`h200.8gpu.96C.1952G`), using two separately pinned jobs.
-- Jobs need package-download access and working InfiniBand. The management Jupyter/client must have network access to the API pod IPs. No public ingress or localhost tunnel is created.
-- For inference, place the complete local checkpoint on NFS. The tested default path is:
-
-```text
-/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017
-```
-
-Use `--model-dir /absolute/path/to/checkpoint` to change it. Launchers validate the config, tokenizer, shard index and weight-file presence before requesting GPUs; they do not download model weights. The repeated directory name above reflects the tested checkpoint layout.
+[Official EP documentation](https://docs.vllm.ai/en/v0.32.0/serving/expert_parallel_deployment/) · [DP and balancing](https://docs.vllm.ai/en/v0.32.0/serving/data_parallel_deployment/).
 
 ### Getting started
 
-Use sample 01 for an infrastructure check, or sample 03 for inference behind one API. These are separate resource-allocating runs; stop an active sample before reusing the same full GPU allocation.
-
 ```bash
 cd /home/jovyan/samples/03-vllm-mp-internal-lb
-
-# Review the resource plan and exact vLLM commands without submitting jobs.
-/usr/bin/python3.12 submit_vllm.py --dry-run
-
-# Start the service with a 12-hour lifetime after readiness.
-/usr/bin/python3.12 submit_vllm.py --serve-minutes 720
-
-# Replace ID with the run directory printed by the launcher.
-RUN_DIR=/home/jovyan/cloud-vllm-dep-single-api-ID
-/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Explain expert parallelism in three sentences." --max-tokens 512
-/usr/bin/python3.12 submit_vllm.py --status "$RUN_DIR"
-/usr/bin/python3.12 submit_vllm.py --diagnose "$RUN_DIR"
-/usr/bin/python3.12 submit_vllm.py --stop "$RUN_DIR"
+/usr/bin/python3.12 submit_vllm.py \
+  --num-nodes 10 --gpus-per-node 8 --tp 1 --dp 80 --ep-size 80 \
+  --allocation-name alloc-huawei-rnd-sr009 --queue-name shared --dry-run
 ```
 
-Inference launchers print progress, save logs/status and return after a verified generated answer. Cloud jobs keep serving for **120 minutes after readiness by default**; set `--serve-minutes` when launching to change this (`720` = 12 hours, `1440` = 24 hours). Sample 01 stops after its test unless `--keep-alive` is supplied. Platform job/project limits still apply independently of these script lifetimes.
+Remove `--dry-run` after reviewing the plan. Each sample README lists every launch/query/stop parameter. Sample 01 loads no model and does not use DP/TP/EP. Sample 04 has an API on every node for local replicas, or only on replica leaders for spanning replicas. No external HTTP balancer is included.
 
-### Run directories and network addresses
+### Lifecycle and limitations
 
-Each launch creates an independent directory under `--nfs-root`. Prefixes remain compatible with the tested launchers:
+Inference launchers return after first generation while jobs keep using GPUs. Default lease: 120 minutes after readiness; `--serve-minutes 720` gives 12 hours. Use `--stop RUN_DIR` and verify platform termination. If supervisors hang, stop the binary job using `platform-job.json`. An NFS path is not an API address; find the endpoint and key-file path in `READY.json`.
 
-| Sample | Run directory prefix | Success marker |
-| --- | --- | --- |
-| 01 | `cloud-ray-ID` | `PASSED.json` |
-| 02 | `cloud-vllm-ep-ID` | `READY.json` |
-| 03 | `cloud-vllm-dep-single-api-ID` | `READY.json` |
-| 04 | `cloud-vllm-dep-ID` | `READY.json` with both API endpoints |
-
-These directories contain configuration, launch snapshots, progress, logs and, for inference, an API key. They are **filesystem paths**, not API addresses. Read `openai_base_url` from `READY.json` for an OpenAI-compatible client; it looks like `http://10.x.x.x:8000/v1`. `localhost` inside Jupyter points to Jupyter, not the GPU job. `query_vllm.py` reads the URL and Bearer key automatically. Generated run directories and caches are excluded by `.gitignore`.
-
-### Runtime versions and validation
-
-GPU jobs use the base image `cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`. Sample 01 pins `ray[default]==2.59.0`; sample 02 pins Ray 2.59.0 and vLLM 0.32.0. Samples 03/04 pin vLLM 0.32.0 without Ray. Inference environments also pin `cuda-toolkit[nvcc,crt,cccl,nvvm,cudart]==13.0.3`. Exact dependencies are in each sample's `requirements-*.txt`.
-
-All four samples were exercised on the target cluster; the inference variants passed sanity requests. Their context/execution presets differ, so this collection does not establish a performance comparison or a long-duration benchmark result. Source code, comments, messages and default prompts are in English; documentation is provided in both languages.
-
-Run the existing local suites separately so each sample loads its own modules. These checks do not allocate cloud GPUs:
+Runtime versions are preserved: worker image py3.12-torch2.9.0:0.0.42, Ray 2.59.0, vLLM 0.32.0 and CUDA toolkit 13.0.3. New sizes are not hardware-validated configurations: verify memory capacity and model kernels separately. Older archives in the parent directory are not updated automatically; this directory contains the current source.
 
 ```bash
 cd /home/jovyan/samples
@@ -94,86 +54,46 @@ done
 
 ## Русский
 
-Четыре самостоятельных примера для начала работы с распределёнными GPU-задачами в **Cloud.ru SR009: два физических узла, до 16 NVIDIA H200**. Примеры инференса используют локальный checkpoint **DeepSeek V4.1 Flash (1017)**. В каждом каталоге находятся свои точки входа, зафиксированные зависимости runtime, тесты и двуязычный README с описанием всех параметров команд.
+Четыре самостоятельных примера для H200 в SR009 с настраиваемым числом узлов и автоматическим размещением без имён серверов. У инференса настраиваются DP, TP, PP и EP. В каждом каталоге собственные исходники, зависимости, тесты и README на двух языках.
 
-### Выбор примера
+| Пример | Назначение | API |
+| --- | --- | --- |
+| [01-ray-cluster](01-ray-cluster/README.md) | Ray: проверка CUDA, обмена объектами и NCCL | нет |
+| [02-vllm-ray](02-vllm-ray/README.md) | Инференс DeepSeek через Ray; по умолчанию TP8/DP2/EP16 | один на головном узле |
+| [03-vllm-mp-internal-lb](03-vllm-mp-internal-lb/README.md) | Multiprocessing и внутренняя балансировка DP | один на узле 0 |
+| [04-vllm-mp-hybrid-lb](04-vllm-mp-hybrid-lb/README.md) | Multiprocessing и гибридная балансировка DP | один на группу узлов реплики |
 
-| Пример | Топология / ресурсы | Точки входа API | Результат |
-| --- | --- | --- | --- |
-| [01 · Кластер Ray](01-ray-cluster/README.md#русский) | Два узла; по 1–8 H200 | Без API модели | Проверка GPU-размещения Ray, CUDA, двусторонней передачи объектов и NCCL AllReduce с сохранением отчёта. |
-| [02 · vLLM + Ray](02-vllm-ray/README.md#русский) | TP8 / DP2 / EP16 / PP1; 16 H200 | Один на головном узле | Инференс под управлением Ray с двумя DP-движками за одним API; проверенный текстовый eager-пресет с контекстом 16K. |
-| [03 · vLLM multiprocessing + internal LB](03-vllm-mp-internal-lb/README.md#русский) | TP1 / DP16 / EP16 / PP1; 16 H200 | Один на головном узле | Штатный multiprocessing и встроенная балансировка между всеми 16 DP-движками; второй узел работает в headless-режиме. |
-| [04 · vLLM multiprocessing + hybrid LB](04-vllm-mp-hybrid-lb/README.md#русский) | TP1 / DP16 / EP16 / PP1; 16 H200 | По одному на узел, всего два | Каждый API распределяет запросы между восемью локальными DP-движками. Узел с API выбирает клиент или внешний HTTP-балансировщик. |
+Запускайте из управляющего Jupyter на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**: именно там доступен **`/usr/bin/python3.12`** и платформенный `client_lib`. Скопируйте каталог примера в общий NFS, например `/home/jovyan/samples`; абсолютные пути должны совпадать в Jupyter и контейнерах задач. Корень запусков должен существовать.
 
-TP — тензорный параллелизм, DP — параллелизм данных, EP — параллелизм экспертов, PP — конвейерный параллелизм. При включённом EP эксперты распределены по группе TP × DP. Оба примера multiprocessing используют штатный vLLM без патчей исходного кода runtime. Внешний HTTP-балансировщик в пример 04 не входит; схема с одним API реализована в примере 03.
+Воркеры используют **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Физические серверы выбирает Cloud.ru: одна binary-задача, `n_workers=N`, `processes_per_worker=1`, без `include_nodes`/`exclude_nodes`. Ранг берётся из MPI; адреса обнаруживаются при запуске. Тип ресурсов — `h200.Ggpu.(12*G)C.(244*G)G`. Доступность типов ресурсов, лимиты аллокации и права очереди проверяет платформа. Ошибка `submit()` выводится сразу; запросы автоматически не повторяются.
 
-```text
-samples/
-├── README.md
-├── .gitignore
-├── 01-ray-cluster/
-├── 02-vllm-ray/
-├── 03-vllm-mp-internal-lb/
-└── 04-vllm-mp-hybrid-lb/
-```
+### Правила топологии
 
-### Требования
+- Выделяются одинаковые 1–8 H200 на каждом из N узлов. Число узлов — любое положительное в пределах платформы.
+- `DP * TP * PP = N * GPU_per_node`. DP по умолчанию вычисляется; явно заданный DP должен использовать все запрошенные GPU.
+- При включённом EP: `EP = TP * DP`; при выключенном EP размер группы EP равен 1. Независимый произвольный EP vLLM 0.32.0 не предоставляет. `--ep-size` проверяет ожидаемый размер.
+- Реплика TP*PP должна целиком помещаться в узле с равномерным размещением либо занимать целое число полных узлов. Локальный DP вычисляется автоматически.
+- Перед отправкой проверяются арифметика топологии и доступная геометрия checkpoint, включая TP для attention/o_groups. Разрешённое размещение экспертов не требует делимости числа экспертов на EP.
+- Проверки планирования не гарантируют достаточную память или поддержку каждой комбинации ядрами модели. Runtime остаётся штатным, без патчей. Новые размеры кластера и комбинации нужно проверить на GPU.
 
-- Запускайте лаунчеры из управляющего Jupyter Cloud.ru на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**. Именно в этом образе Jupyter доступен **`/usr/bin/python3.12`**, используемый во всех командах ниже, и установлен платформенный `client_lib`. Общей установки зависимостей в корне нет: Ray/vLLM устанавливаются в изолированное окружение внутри задач.
-- Скопируйте репозиторий на общий NFS, например в `/home/jovyan/samples`. Пути NFS должны совпадать и быть доступны в Jupyter и контейнерах задач. Корень запусков по умолчанию — `/home/jovyan`; каталог должен существовать.
-- Если проверенные узлы (`hpcsrv-201.sr009`, `hpcsrv-202.sr009`) не соответствуют вашей квоте, укажите два разных доступных узла SR009 через `--nodes NODE0 NODE1`. Инференс запрашивает по восемь H200 на каждом (`h200.8gpu.96C.1952G`), отправляя две отдельно закреплённые задачи.
-- Задачам нужны доступ к загрузке пакетов и рабочий InfiniBand. Управляющий Jupyter/клиент должен иметь сетевой доступ к IP подов с API. Публичный ingress и туннель на localhost не создаются.
-- Для инференса разместите полный локальный checkpoint на NFS. Проверенный путь по умолчанию:
-
-```text
-/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017
-```
-
-Другой путь задаётся через `--model-dir /absolute/path/to/checkpoint`. До запроса GPU лаунчеры проверяют конфигурацию, токенизатор, индекс шардов и наличие файлов весов; сами веса они не скачивают. Повтор имени каталога выше соответствует проверенной структуре checkpoint.
+[Официальная документация EP](https://docs.vllm.ai/en/v0.32.0/serving/expert_parallel_deployment/) · [DP и балансировка](https://docs.vllm.ai/en/v0.32.0/serving/data_parallel_deployment/).
 
 ### Начало работы
 
-Используйте пример 01 для проверки инфраструктуры или пример 03 для инференса с одним API. Каждый запуск отдельно выделяет ресурсы; перед повторным использованием всех GPU остановите активный пример.
-
 ```bash
 cd /home/jovyan/samples/03-vllm-mp-internal-lb
-
-# Проверить план ресурсов и точные команды vLLM без отправки задач.
-/usr/bin/python3.12 submit_vllm.py --dry-run
-
-# Запустить сервис на 12 часов после готовности.
-/usr/bin/python3.12 submit_vllm.py --serve-minutes 720
-
-# Заменить ID каталогом запуска, напечатанным лаунчером.
-RUN_DIR=/home/jovyan/cloud-vllm-dep-single-api-ID
-/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Explain expert parallelism in three sentences." --max-tokens 512
-/usr/bin/python3.12 submit_vllm.py --status "$RUN_DIR"
-/usr/bin/python3.12 submit_vllm.py --diagnose "$RUN_DIR"
-/usr/bin/python3.12 submit_vllm.py --stop "$RUN_DIR"
+/usr/bin/python3.12 submit_vllm.py \
+  --num-nodes 10 --gpus-per-node 8 --tp 1 --dp 80 --ep-size 80 \
+  --allocation-name alloc-huawei-rnd-sr009 --queue-name shared --dry-run
 ```
 
-Лаунчеры инференса выводят прогресс, сохраняют логи/статус и завершаются после проверенного сгенерированного ответа. Облачные задачи продолжают обслуживать запросы **120 минут после готовности по умолчанию**; время меняется при запуске через `--serve-minutes` (`720` = 12 часов, `1440` = 24 часа). Пример 01 останавливается после теста, если не указан `--keep-alive`. Ограничения платформы на задачи/проект действуют независимо от этих лимитов скриптов.
+После проверки плана уберите `--dry-run`. Подробные параметры запуска, запросов и остановки — в README выбранного примера. Пример 01 не загружает модель и не использует DP/TP/EP. В примере 04 локальная реплика даёт API на каждом узле, а реплика на нескольких узлах — API только на ведущем. Внешний HTTP-балансировщик не входит в набор.
 
-### Каталоги запусков и сетевые адреса
+### Жизненный цикл и ограничения
 
-Каждый запуск создаёт отдельный каталог внутри `--nfs-root`. Префиксы сохранены совместимыми с проверенными лаунчерами:
+Лаунчеры инференса возвращаются после первой генерации, но задачи продолжают занимать GPU. По умолчанию lease — 120 минут после готовности; `--serve-minutes 720` — 12 часов. Используйте `--stop RUN_DIR` и проверяйте завершение задачи на платформе. При зависании остановите binary-задачу по ID из `platform-job.json`. Путь NFS не является адресом API; адрес и путь к API-ключу находятся в `READY.json`.
 
-| Пример | Префикс каталога запуска | Признак успеха |
-| --- | --- | --- |
-| 01 | `cloud-ray-ID` | `PASSED.json` |
-| 02 | `cloud-vllm-ep-ID` | `READY.json` |
-| 03 | `cloud-vllm-dep-single-api-ID` | `READY.json` |
-| 04 | `cloud-vllm-dep-ID` | `READY.json` с адресами обоих API |
-
-В них находятся конфигурация, копии файлов запуска, прогресс, логи и API-ключ для инференса. Это **пути в файловой системе**, а не адреса API. Для OpenAI-совместимого клиента берите `openai_base_url` из `READY.json`: например, `http://10.x.x.x:8000/v1`. `localhost` в Jupyter указывает на сам Jupyter, а не на GPU-задачу. `query_vllm.py` автоматически читает URL и Bearer-ключ. Созданные каталоги запусков и кэши исключены через `.gitignore`.
-
-### Версии runtime и проверки
-
-GPU-задачи используют готовый базовый образ `cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`. В примере 01 зафиксирован `ray[default]==2.59.0`; в примере 02 — Ray 2.59.0 и vLLM 0.32.0. В примерах 03/04 — vLLM 0.32.0 без Ray. Окружения инференса также фиксируют `cuda-toolkit[nvcc,crt,cccl,nvvm,cudart]==13.0.3`. Точные зависимости находятся в `requirements-*.txt` соответствующих каталогов.
-
-Все четыре примера были проверены на целевом кластере; варианты инференса прошли sanity-запросы. Их настройки контекста/выполнения различаются, поэтому этот набор не является сравнением производительности или результатом длительного нагрузочного теста. Исходный код, комментарии, сообщения и промпты по умолчанию написаны на английском; документация доступна на двух языках.
-
-Запускайте существующие локальные тесты отдельно для каждого примера, чтобы загружались его собственные модули. Эти проверки не выделяют GPU в облаке:
+Версии runtime сохранены: worker image py3.12-torch2.9.0:0.0.42, Ray 2.59.0, vLLM 0.32.0, CUDA toolkit 13.0.3. Новый размер кластера не является подтверждённой GPU-конфигурацией: память и ядра модели необходимо проверять отдельно. Старые архивы в родительском каталоге не обновляются автоматически; актуальные исходники находятся здесь.
 
 ```bash
 cd /home/jovyan/samples
@@ -181,3 +101,4 @@ for sample in 01-ray-cluster 02-vllm-ray 03-vllm-mp-internal-lb 04-vllm-mp-hybri
   (cd "$sample" && PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v) || exit 1
 done
 ```
+

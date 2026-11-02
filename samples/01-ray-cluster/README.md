@@ -1,88 +1,67 @@
-# 01 · Ray cluster and NCCL smoke test
+# Ray cluster and GPU smoke test
 
-[English](#english) · [Русский](#русский) · [All samples / Все примеры](../README.md)
+[English](#english) · [Русский](#русский)
 
 ## English
 
-### What this sample provides
+This sample creates a Ray cluster with a configurable node count and verifies CUDA on every GPU, object transfer in both directions around a ring of nodes, and NCCL AllReduce across all GPUs. No model is loaded. Defaults: two nodes with one GPU each. A single node is supported; cross-node checks are then not applicable. DP/TP/EP are inference settings and do not apply to this infrastructure sample.
 
-Creates a two-node Ray cluster on Cloud.ru SR009 and checks GPU scheduling, CUDA execution, Ray object transfers in both directions and a data-checked NCCL AllReduce. The result is a `PASSED.json` report with resource information and timing/bandwidth measurements. This is a functional infrastructure smoke test; its measurements are not a peak-bandwidth benchmark.
+### Requirements
 
-The default uses one H200 on each node (two GPUs total); `--gpus-per-node 8` checks all 16 GPUs. No model checkpoint is needed. By default both jobs stop after the test; `--keep-alive` leaves Ray available for a bounded period.
+Run from the management Jupyter image **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**, which provides **`/usr/bin/python3.12`** and the platform `client_lib`. Copy the sample onto shared NFS, for example `/home/jovyan/samples`; absolute paths must match in Jupyter and worker containers. The run root must already exist.
+
+Workers use **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Cloud.ru selects physical hosts: one binary job with `n_workers=N` and `processes_per_worker=1`, without `include_nodes`/`exclude_nodes`. Node ranks come from MPI and addresses are discovered at launch. Resource shape: `h200.Ggpu.(12*G)C.(244*G)G`. The platform enforces available shapes, allocation limits and queue permissions. Rejected submissions fail visibly; there are no automatic submission retries.
 
 ### Included files
 
-- `submit_ray.py`: management entrypoint; submits jobs, waits for the report and requests shutdown.
-- `bootstrap_ray.py`, `ray_node.py`: isolated environment installation, physical-node/GPU checks and Ray supervision.
-- `smoke_test.py`, `cluster_common.py`: GPU actors, communication checks, job configuration and shared-file helpers.
-- `requirements-ray.txt`: Ray version pin; `tests/test_cluster.py`: local tests with mocked cloud operations.
+- Launcher, bootstrap and per-node supervisors; `cluster_common.py` and `topology.py` handle placement, discovery and validation.
+- `requirements-*.txt` pins runtime; `tests/` checks plans and lifecycle without cloud GPUs.
 
-### Run
-
-Use Cloud.ru management Jupyter with the **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`** image, which provides **`/usr/bin/python3.12`** and the platform-provided `client_lib`. Copy the repository to shared NFS, normally `/home/jovyan/samples`; that path must also be visible inside jobs. The default hosts must be available in your SR009 project; use `--nodes` for your allocation. Jobs need package-download access and working InfiniBand. Ray is installed inside jobs, not in Jupyter.
+### Launch
 
 ```bash
 cd /home/jovyan/samples/01-ray-cluster
 
-# Inspect the job plan without allocating resources.
-/usr/bin/python3.12 submit_ray.py --dry-run
-
-# Run the default two-GPU check and stop automatically.
-/usr/bin/python3.12 submit_ray.py
-
-# Alternatively, check all 16 GPUs and retain Ray for up to 30 minutes.
-/usr/bin/python3.12 submit_ray.py --gpus-per-node 8 --keep-alive --keep-minutes 30
+/usr/bin/python3.12 submit_ray.py --num-nodes 3 --gpus-per-node 2 --dry-run
+/usr/bin/python3.12 submit_ray.py --num-nodes 3 --gpus-per-node 2 --keep-alive --keep-minutes 60
 ```
 
-Use the exact run directory printed by the command; replace `ID` below. `head.json` contains the Ray address and private dashboard URL. `PASSED.json` is written only after the checks succeed.
-
-```bash
-RUN_DIR=/home/jovyan/cloud-ray-ID
-/usr/bin/python3.12 -m json.tool "$RUN_DIR/PASSED.json"
-/usr/bin/python3.12 -m json.tool "$RUN_DIR/head.json"
-/usr/bin/python3.12 submit_ray.py --stop "$RUN_DIR"
-```
-
-`--prepare-only` creates a run snapshot without submitting jobs. Each run has independent files: `run.json`, `launch-*.sh`, `node-*.json`, `head.json`, `PASSED.json`, `install-*.log`, `ray-start-*.log`, `smoke.log` and `nccl.*.log`. Failures are saved as `*-error*.json`; shutdown creates `STOP` and then `stopped-*.json`.
-
-### Launch parameters
-
-All options belong to `submit_ray.py`. `BASE_IMAGE` is:
-
-```text
-cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42
-```
+### All launcher parameters
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `--image IMAGE` | `BASE_IMAGE` | GPU job image shown above; full `cr.ai.cloud.ru` reference with a tag or digest. |
-| `--nodes NODE0 NODE1` | `hpcsrv-201.sr009 hpcsrv-202.sr009` | Two physical node names, head first. |
-| `--gpus-per-node N` | `1` | GPUs on each node, from 1 to 8; total GPU count is `2 × N`. |
-| `--cpus-per-node N` | `12 × GPUs per node` | Logical Ray CPUs per node, at least the GPU count; does not change the Cloud.ru instance shape. |
-| `--nfs-root PATH` | `/home/jovyan` | Existing shared directory for run snapshots and results. |
-| `--placement MODE` | `pinned` | `pinned`: two jobs pinned to separate hosts. `single-job`: one job with two workers; the physical-node check still applies. |
-| `--startup-timeout SECONDS` | `900` | Positive startup time budget for node registration and Ray. |
-| `--test-timeout SECONDS` | `600` | Positive test time budget after the Ray head is ready. |
-| `--keep-alive` | `false` | Keep the cluster after a successful test. |
-| `--keep-minutes MINUTES` | `30` | Positive maximum retention after the test; effective with `--keep-alive`. |
-| `--dry-run` | `false` | Print configuration and job requests; create no files or jobs. |
-| `--prepare-only` | `false` | Write a launch snapshot to NFS without submitting jobs. |
-| `--stop RUN_DIR` | — | Write a shutdown request for an existing run containing `run.json`. |
-| `-h`, `--help` | — | Print command help and exit. |
+| `--num-nodes N` | `2` | Number of automatically placed workers. |
+| `--gpus-per-node N` | `1` | Uniform H200 count per worker, 1..8. |
+| `--cpus-per-node N` | `12*GPUs` | CPU resources advertised to Ray; at least one CPU per GPU. Platform shape remains 12 CPUs/GPU. |
+| `--allocation-name NAME` | `workspace default` | Training allocation name. |
+| `--queue-name NAME` | `shared` | Target queue; shared is selected explicitly by default. |
+| `--image IMAGE` | `cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42` | Existing worker container image. |
+| `--nfs-root PATH` | `/home/jovyan` | Existing shared run root. |
+| `--startup-timeout SECONDS` | `900` | Queue/install/registration timeout. |
+| `--test-timeout SECONDS` | `600` | Smoke-test timeout after the head starts. |
+| `--keep-alive` | `off` | Keep Ray running after a successful test. |
+| `--keep-minutes MINUTES` | `30` | Maximum keep-alive lease after the test. |
+| `--dry-run` | `off` | Print job plan; no files, SDK imports or cloud resources. |
+| `--prepare-only` | `off` | Write run snapshot without submitting jobs. |
+| `--stop RUN_DIR` | `—` | Ask all node supervisors to terminate Ray. |
+| `-h / --help` | `—` | Show help. |
 
-### Worker entrypoints
+### Results and stopping
 
-The submit script starts these automatically inside jobs; they are not additional getting-started steps. All accept `-h` / `--help`.
+Each launch creates a separate directory and snapshots its source. `run.json` stores configuration, `platform-job.json` the job ID/submission reply, and `node-RANK.json`/`stopped-RANK.json` record discovered workers and shutdown. Expect records for all N node ranks. A rejected submission may create no platform job.
 
-| Script | Arguments | Description |
-| --- | --- | --- |
-| `bootstrap_ray.py` | `--run-dir PATH --rank RANK` | Required: run snapshot; rank `0`, `1` or `auto` (MPI environment). |
-| `ray_node.py` | `--run-dir PATH --rank 0\|1` | Required: run snapshot and node rank. |
-| `smoke_test.py` | `--run-dir PATH` | Required: run snapshot with head and node metadata. |
+`PASSED.json` contains results and metadata. Without `--keep-alive`, Ray stops after the test; otherwise GPUs remain allocated until lease expiry or explicit shutdown.
 
-### Local checks
+```bash
+RUN_DIR=/home/jovyan/cloud-ray-ID
+/usr/bin/python3.12 submit_ray.py --stop "$RUN_DIR"
+```
 
-Run from this directory; no cloud allocation or model weights are needed.
+**Stop the service when finished and verify that the Cloud.ru binary job actually ends.** STOP is an NFS request; if supervisors hang, stop the platform job using the ID from `platform-job.json`. Ctrl+C while the launcher is active invokes cleanup. Check every `stopped-RANK.json` and a terminal platform status; Terminating does not yet confirm resource release.
+
+### Versions and validation
+
+Ray 2.59.0. The original two-node preset was exercised on GPUs. The generalized version has local plan/lifecycle tests; this does not validate every topology on hardware. All source comments and messages are in English.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
@@ -90,86 +69,66 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 
 ## Русский
 
-### Что даёт пример
+Пример создаёт кластер Ray на настраиваемом числе узлов, проверяет CUDA на каждой GPU, передачу объектов между соседними узлами в обоих направлениях и NCCL AllReduce на всех GPU. Модель не загружается. По умолчанию — два узла по одной GPU. Один узел также поддерживается; межузловая проверка тогда неприменима. DP/TP/EP относятся к инференсу и в этом инфраструктурном примере не используются.
 
-Создаёт двухузловой кластер Ray в Cloud.ru SR009 и проверяет размещение GPU-акторов, выполнение CUDA, передачу объектов Ray в обе стороны и NCCL AllReduce с проверкой данных. Результат — отчёт `PASSED.json` с ресурсами и измерениями времени/пропускной способности. Это функциональная проверка инфраструктуры; её измерения не являются тестом пиковой пропускной способности.
+### Требования
 
-По умолчанию используется по одной H200 на узел, всего две GPU; `--gpus-per-node 8` проверяет все 16 GPU. Веса модели не нужны. После теста обе задачи автоматически завершаются; с `--keep-alive` Ray продолжает работать ограниченное время.
+Запускайте из управляющего Jupyter на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**: именно там доступен **`/usr/bin/python3.12`** и платформенный `client_lib`. Скопируйте каталог примера в общий NFS, например `/home/jovyan/samples`; абсолютные пути должны совпадать в Jupyter и контейнерах задач. Корень запусков должен существовать.
+
+Воркеры используют **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Физические серверы выбирает Cloud.ru: одна binary-задача, `n_workers=N`, `processes_per_worker=1`, без `include_nodes`/`exclude_nodes`. Ранг берётся из MPI; адреса обнаруживаются при запуске. Тип ресурсов — `h200.Ggpu.(12*G)C.(244*G)G`. Доступность типов ресурсов, лимиты аллокации и права очереди проверяет платформа. Ошибка `submit()` выводится сразу; запросы автоматически не повторяются.
 
 ### Состав
 
-- `submit_ray.py`: точка входа из управляющего Jupyter; отправка задач, ожидание отчёта и остановка.
-- `bootstrap_ray.py`, `ray_node.py`: установка изолированного окружения, проверка физических узлов/GPU и управление Ray.
-- `smoke_test.py`, `cluster_common.py`: GPU-акторы, проверки связи, конфигурация задач и работа с общими файлами.
-- `requirements-ray.txt`: зафиксированная версия Ray; `tests/test_cluster.py`: локальные тесты с имитацией облачных операций.
+- Лаунчер, bootstrap и управляющий процесс на каждый узел; `cluster_common.py` и `topology.py` для размещения, обнаружения и проверок.
+- `requirements-*.txt` фиксирует runtime; `tests/` проверяет планы и жизненный цикл без облачных GPU.
 
 ### Запуск
-
-Используйте управляющий Jupyter Cloud.ru на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**. Именно в этом образе доступен **`/usr/bin/python3.12`** и установлен платформенный `client_lib`. Скопируйте репозиторий на общий NFS, обычно в `/home/jovyan/samples`; этот путь должен быть доступен и внутри задач. Узлы по умолчанию должны быть доступны в вашем проекте SR009; для других укажите `--nodes`. Задачам нужны доступ к загрузке пакетов и рабочий InfiniBand. Ray устанавливается внутри задач, а не в Jupyter.
 
 ```bash
 cd /home/jovyan/samples/01-ray-cluster
 
-# Посмотреть план без выделения ресурсов.
-/usr/bin/python3.12 submit_ray.py --dry-run
-
-# Проверить две GPU и автоматически остановить кластер.
-/usr/bin/python3.12 submit_ray.py
-
-# Другой вариант: проверить 16 GPU и оставить Ray максимум на 30 минут.
-/usr/bin/python3.12 submit_ray.py --gpus-per-node 8 --keep-alive --keep-minutes 30
+/usr/bin/python3.12 submit_ray.py --num-nodes 3 --gpus-per-node 2 --dry-run
+/usr/bin/python3.12 submit_ray.py --num-nodes 3 --gpus-per-node 2 --keep-alive --keep-minutes 60
 ```
 
-Используйте точный каталог запуска, напечатанный командой; ниже замените `ID`. В `head.json` находятся адрес Ray и URL внутреннего dashboard. `PASSED.json` появляется только после успешных проверок.
-
-```bash
-RUN_DIR=/home/jovyan/cloud-ray-ID
-/usr/bin/python3.12 -m json.tool "$RUN_DIR/PASSED.json"
-/usr/bin/python3.12 -m json.tool "$RUN_DIR/head.json"
-/usr/bin/python3.12 submit_ray.py --stop "$RUN_DIR"
-```
-
-`--prepare-only` создаёт файлы запуска без отправки задач. Для каждого запуска отдельно сохраняются `run.json`, `launch-*.sh`, `node-*.json`, `head.json`, `PASSED.json`, `install-*.log`, `ray-start-*.log`, `smoke.log` и `nccl.*.log`. Ошибки записываются в `*-error*.json`; при остановке появляются `STOP`, затем `stopped-*.json`.
-
-### Параметры запуска
-
-Все параметры относятся к `submit_ray.py`. Значение `BASE_IMAGE`:
-
-```text
-cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42
-```
+### Все параметры лаунчера
 
 | Параметр | По умолчанию | Описание |
 | --- | --- | --- |
-| `--image IMAGE` | `BASE_IMAGE` | Образ GPU-задачи указан выше; полный адрес `cr.ai.cloud.ru` с тегом или digest. |
-| `--nodes NODE0 NODE1` | `hpcsrv-201.sr009 hpcsrv-202.sr009` | Имена двух физических узлов, головной — первым. |
-| `--gpus-per-node N` | `1` | GPU на каждом узле: от 1 до 8; всего `2 × N` GPU. |
-| `--cpus-per-node N` | `12 × GPUs per node` | Логические CPU Ray на узел, не меньше числа GPU; не меняет тип инстанса Cloud.ru. |
-| `--nfs-root PATH` | `/home/jovyan` | Существующий общий каталог для файлов запусков и результатов. |
-| `--placement MODE` | `pinned` | `pinned`: две задачи, каждая закреплена за своим узлом. `single-job`: одна задача с двумя воркерами; проверка разных физических узлов сохраняется. |
-| `--startup-timeout SECONDS` | `900` | Положительный лимит времени на регистрацию узлов и запуск Ray. |
-| `--test-timeout SECONDS` | `600` | Положительный лимит времени на тест после готовности головного процесса Ray. |
-| `--keep-alive` | `false` | Оставить кластер работающим после успешного теста. |
-| `--keep-minutes MINUTES` | `30` | Положительный лимит работы после теста; действует с `--keep-alive`. |
-| `--dry-run` | `false` | Вывести конфигурацию и запросы ресурсов без создания файлов и задач. |
-| `--prepare-only` | `false` | Создать файлы запуска на NFS без отправки задач. |
-| `--stop RUN_DIR` | — | Запросить остановку существующего запуска с файлом `run.json`. |
-| `-h`, `--help` | — | Вывести справку и завершиться. |
+| `--num-nodes N` | `2` | Число автоматически размещаемых воркеров. |
+| `--gpus-per-node N` | `1` | Одинаковое число H200 на воркер, 1..8. |
+| `--cpus-per-node N` | `12*GPUs` | CPU, объявленные Ray; не меньше одного на GPU. Платформа выделяет 12 CPU/GPU. |
+| `--allocation-name NAME` | `workspace default` | Имя аллокации задач обучения. |
+| `--queue-name NAME` | `shared` | Целевая очередь; по умолчанию явно выбирается shared. |
+| `--image IMAGE` | `cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42` | Готовый образ контейнера воркеров. |
+| `--nfs-root PATH` | `/home/jovyan` | Существующий общий каталог запусков. |
+| `--startup-timeout SECONDS` | `900` | Таймаут очереди, установки и регистрации. |
+| `--test-timeout SECONDS` | `600` | Таймаут smoke-теста после старта головного узла. |
+| `--keep-alive` | `off` | Оставить Ray работать после успешного теста. |
+| `--keep-minutes MINUTES` | `30` | Максимальный срок keep-alive после теста. |
+| `--dry-run` | `off` | Показать план; без файлов, импорта SDK и облачных ресурсов. |
+| `--prepare-only` | `off` | Записать копию запуска без отправки задач. |
+| `--stop RUN_DIR` | `—` | Попросить управляющие процессы всех узлов остановить Ray. |
+| `-h / --help` | `—` | Показать справку. |
 
-### Служебные точки входа
+### Результаты и остановка
 
-Скрипт отправки запускает их автоматически внутри задач; вручную запускать их для начала работы не требуется. Все поддерживают `-h` / `--help`.
+Каждый запуск создаёт отдельный каталог и копирует туда исходники. `run.json` хранит конфигурацию, `platform-job.json` — ID/ответ отправки, `node-RANK.json` и `stopped-RANK.json` — фактические узлы и завершение. Нужны записи для всех N рангов. При ошибке отправки задача может не существовать на платформе.
 
-| Скрипт | Аргументы | Описание |
-| --- | --- | --- |
-| `bootstrap_ray.py` | `--run-dir PATH --rank RANK` | Обязательны: каталог запуска; ранг `0`, `1` или `auto` (из окружения MPI). |
-| `ray_node.py` | `--run-dir PATH --rank 0\|1` | Обязательны: каталог запуска и ранг узла. |
-| `smoke_test.py` | `--run-dir PATH` | Обязателен каталог запуска с метаданными головного процесса и узлов. |
+`PASSED.json` содержит результаты и метаданные. Без `--keep-alive` пример сам завершает Ray после теста; с ним GPU заняты до конца lease или явной остановки.
 
-### Локальные проверки
+```bash
+RUN_DIR=/home/jovyan/cloud-ray-ID
+/usr/bin/python3.12 submit_ray.py --stop "$RUN_DIR"
+```
 
-Выполняются из этого каталога без выделения облачных ресурсов и без весов модели.
+**После работы обязательно остановите сервис и проверьте завершение binary-задачи в Cloud.ru.** STOP — запрос через NFS; если воркеры зависли, остановите задачу платформы по ID из `platform-job.json`. Ctrl+C во время активного лаунчера включает его очистку. Проверьте `stopped-RANK.json` для всех узлов и конечный статус платформы; Terminating ещё не означает освобождение ресурсов.
+
+### Версии и проверка
+
+Ray 2.59.0. Исходный пресет на двух узлах ранее проверен на GPU. Новая параметризованная версия проверяется локальными тестами; это не подтверждение работоспособности всех топологий на оборудовании. Все комментарии и сообщения исходного кода — на английском.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 ```
+

@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--rank", required=True)
     args = parser.parse_args()
-    rank = resolve_rank(args.rank)
+    rank = resolve_rank(args.rank, num_nodes=read_json(args.run_dir / "run.json")["num_nodes"])
     run = args.run_dir
     try:
         config = read_json(run / "run.json")

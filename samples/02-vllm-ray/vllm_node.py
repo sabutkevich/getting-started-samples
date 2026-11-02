@@ -12,6 +12,7 @@ import traceback
 from pathlib import Path
 
 from cluster_common import atomic_json, read_json, wait_json
+from topology import wait_nodes
 from ray_node import alive, archive_logs, preflight, ray_command
 from vllm_common import VLLM_VERSION, distributed_environment, inspect_model, stop_process_group, validate_topology
 
@@ -43,25 +44,20 @@ def serve_node(run, rank):
             raise RuntimeError("Model files differ from the NFS checkpoint validated at submission")
         info = preflight(config, rank)
         from ep_preflight import check_ep_backend
-        info["ep_preflight"] = check_ep_backend()
-        if not any(p.get("link_layer") == "InfiniBand" and p.get("state", "").startswith("4:")
+        if config["enable_expert_parallel"]:
+            info["ep_preflight"] = check_ep_backend()
+        if config["num_nodes"] > 1 and not any(p.get("link_layer") == "InfiniBand" and p.get("state", "").startswith("4:")
                    for p in info["rdma_ports"]):
             raise RuntimeError("No ACTIVE InfiniBand port available")
         info.update(vllm=vllm.__version__, model_manifest=manifest,
                     packages_sha256=hashlib.sha256((run / f"packages-{rank}.txt").read_bytes()).hexdigest())
         atomic_json(run / f"node-{rank}.json", info)
         print(json.dumps(info, indent=2), flush=True)
-        peer = wait_json(run / f"node-{1-rank}.json", config["startup_timeout"], stop)
-        if info["packages_sha256"] != peer["packages_sha256"]:
-            raise RuntimeError("Installed dependencies differ between nodes; compare packages-0.txt and packages-1.txt")
-        if info["ip"] == peer["ip"]:
-            raise RuntimeError("Both jobs resolved to the same pod IP")
-        if info["boot_hash"] and info["boot_hash"] == peer["boot_hash"]:
-            raise RuntimeError("Same physical host boot ID; check include_nodes/platform placement")
-        env = distributed_environment(config, [info, peer], rank, os.environ)
+        metadata = wait_nodes(run, config, stop)
+        env = distributed_environment(config, metadata, rank, os.environ)
         env.update(NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="INIT,NET,GRAPH",
                    NCCL_DEBUG_FILE=str(run / "nccl.%h.%p.log"))
-        hosts = [info["ip"], peer["ip"], "localhost", "127.0.0.1"]
+        hosts = [entry["ip"] for entry in metadata] + ["localhost", "127.0.0.1"]
         for name in ("NO_PROXY", "no_proxy"):
             env[name] = ",".join(filter(None, [env.get(name, ""), *hosts]))
         env.pop("RAY_ADDRESS", None)
@@ -130,6 +126,6 @@ def serve_node(run, rank):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--rank", type=int, required=True)
     args = parser.parse_args()
     serve_node(args.run_dir, args.rank)

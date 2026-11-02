@@ -12,6 +12,7 @@ import traceback
 from pathlib import Path
 
 from cluster_common import RAY_VERSION, atomic_json, pod_ipv4, read_json, wait_json
+from topology import wait_nodes
 
 
 def fingerprint(path):
@@ -58,7 +59,7 @@ def preflight(config, rank):
         ports.append(info)
     return {
         "rank": rank, "pod": socket.gethostname(), "ip": pod_ipv4(),
-        "requested_node": config["nodes"][rank] if config["placement"] == "pinned" else None,
+        "placement": "automatic",
         "boot_hash": fingerprint("/proc/sys/kernel/random/boot_id"),
         "python": sys.version, "ray": ray.__version__, "torch": torch.__version__,
         "torch_cuda": torch.version.cuda, "nccl": torch.cuda.nccl.version(),
@@ -121,15 +122,10 @@ def run_node(run, rank):
         info = preflight(config, rank)
         atomic_json(run / f"node-{rank}.json", info)
         print(json.dumps(info, indent=2), flush=True)
-        peer = wait_json(run / f"node-{1-rank}.json", config["startup_timeout"], stop)
-        if info["ip"] == peer["ip"]:
-            raise RuntimeError("Both Ray nodes resolved to the same pod IP")
-        if config["placement"] == "single-job":
-            if info["boot_hash"] and info["boot_hash"] == peer["boot_hash"]:
-                raise RuntimeError("Two workers may share a physical host. Use default --placement pinned")
+        wait_nodes(run, config, stop)
         stage = "start-ray"
         address = None
-        if rank == 1:
+        if rank != 0:
             address = wait_json(run / "head.json", config["startup_timeout"], stop)["address"]
         command = ray_command(config, rank, info["ip"], address)
         env = dict(os.environ, RAY_USAGE_STATS_ENABLED="0", PYTHONUNBUFFERED="1",
@@ -212,6 +208,6 @@ def run_node(run, rank):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--rank", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--rank", type=int, required=True)
     args = parser.parse_args()
     run_node(args.run_dir, args.rank)

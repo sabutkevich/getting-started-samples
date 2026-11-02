@@ -1,139 +1,128 @@
-# 03 · DeepSeek V4.1 Flash with one API and internal load balancing
+# DeepSeek V4.1 Flash with multiprocessing and internal LB
 
-[English](#english) · [Русский](#русский) · [All samples / Все примеры](../README.md)
+[English](#english) · [Русский](#русский)
 
 ## English
 
-### What this sample provides
+One API on node 0 routes requests across all DP engines; remaining workers are headless.
 
-Serves DeepSeek V4.1 Flash (1017) on two nodes with 16 H200 GPUs using native vLLM multiprocessing: **TP1 / DP16 / EP16 / PP1**, eight DP engines per node. The MoE experts span all 16 GPUs. Uses stock vLLM 0.32.0 and the Rust frontend, without runtime source patches or Ray.
+Node/GPU counts, DP, TP, PP and EP enablement are configurable. Defaults preserve the earlier topology: TP1 / DP16 / EP16 / PP1.
 
-**Internal load balancing with one API:** the head node exposes the only HTTP endpoint. The built-in vLLM load balancer distributes requests across all 16 DP engines, including those on the headless second node. Readiness requires a real generated answer and NCCL InfiniBand channel evidence.
+### Requirements
 
-The launcher leaves the context, sequence count, memory budget, CUDA graph and model-backend defaults to vLLM unless an exposed override is supplied. In the tested checkpoint the reported maximum context was **1,048,576 tokens**; this is a model limit, not a guarantee of available KV-cache capacity for every workload. Context includes input plus output.
+Run from the management Jupyter image **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**, which provides **`/usr/bin/python3.12`** and the platform `client_lib`. Copy the sample onto shared NFS, for example `/home/jovyan/samples`; absolute paths must match in Jupyter and worker containers. The run root must already exist.
+
+Workers use **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Cloud.ru selects physical hosts: one binary job with `n_workers=N` and `processes_per_worker=1`, without `include_nodes`/`exclude_nodes`. Node ranks come from MPI and addresses are discovered at launch. Resource shape: `h200.Ggpu.(12*G)C.(244*G)G`. The platform enforces available shapes, allocation limits and queue permissions. Rejected submissions fail visibly; there are no automatic submission retries.
+
+Default checkpoint:
+
+```text
+/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017
+```
+
+Package-download access and InfiniBand are required for multiple nodes. Clients must reach API pod IPs; Jupyter localhost is not the job API address.
 
 ### Included files
 
-- `submit_vllm.py`, `query_vllm.py`: submit/manage the service and send an authenticated request.
-- `bootstrap_vllm.py`, `vllm_node.py`: install the isolated runtime, verify nodes/GPUs and supervise vLLM.
-- `vllm_common.py`, `cluster_common.py`: checkpoint validation, server command, environment, HTTP and Cloud.ru job helpers.
-- `diagnose_vllm.py`: extract saved startup/worker errors, including interleaved tracebacks.
-- `requirements-vllm.txt`: runtime pins; `tests/test_dep.py`: cloud-free deployment/lifecycle tests.
+- Launcher, bootstrap and per-node supervisors; `cluster_common.py` and `topology.py` handle placement, discovery and validation.
+- `requirements-*.txt` pins runtime; `tests/` checks plans and lifecycle without cloud GPUs.
+- `vllm_common.py` builds model commands; `query_vllm.py` sends requests. Logs, errors and readiness are saved on NFS.
 
-### Run
-
-Use Cloud.ru SR009 management Jupyter with the **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`** image, which provides **`/usr/bin/python3.12`** and the platform-provided `client_lib`; reserve two distinct nodes with eight H200 GPUs each. The defaults target `hpcsrv-201.sr009` and `hpcsrv-202.sr009`. The repository and complete model checkpoint must be on NFS accessible at the same absolute paths from Jupyter and both job containers. Jobs need dependency-download access and active InfiniBand; Jupyter must be able to reach the job pod IPs. No custom image build is required.
+### Launch
 
 ```bash
 cd /home/jovyan/samples/03-vllm-mp-internal-lb
 
-# Inspect the plan without reading weights or allocating GPUs.
-/usr/bin/python3.12 submit_vllm.py --dry-run
-
-# Launch with the tested defaults; retain the service for 12 hours after readiness.
-/usr/bin/python3.12 submit_vllm.py --serve-minutes 720
+/usr/bin/python3.12 submit_vllm.py --num-nodes 3 --gpus-per-node 8 --tp 1 --dry-run
+/usr/bin/python3.12 submit_vllm.py --num-nodes 3 --gpus-per-node 8 --tp 1 --serve-minutes 720
 ```
 
-To use another checkpoint or allocation, add `--model-dir /absolute/path/to/checkpoint --nodes NODE0 NODE1`. `--prepare-only` validates weights and creates launch files without allocating GPUs. The submit command prints installation/startup progress and returns after the first verified response; the service continues in cloud jobs. Omitting `--serve-minutes` gives a two-hour lease after readiness.
+Example: ten nodes, TP2, DP40, EP80:
 
-Replace `ID` below with the exact printed run directory.
+```bash
+/usr/bin/python3.12 submit_vllm.py \
+  --num-nodes 10 --gpus-per-node 8 \
+  --tp 2 --dp 40 --ep-size 80 \
+  --allocation-name alloc-huawei-rnd-sr009 --queue-name shared \
+  --startup-timeout 7200 --serve-minutes 720 --dry-run
+```
+
+Remove `--dry-run` after reviewing the plan to submit it. EP-off example: `--num-nodes 2 --tp 8 --dp 2 --no-enable-expert-parallel --ep-size 1`. For spanning TP/PP, inspect `--num-nodes 4 --tp 8 --pp 2 --dp 2 --dry-run`; model compatibility still needs GPU validation.
+
+### Topology rules
+
+- Each of N workers requests the same 1–8 H200 GPUs. N is any positive count accepted by the platform.
+- `DP * TP * PP = N * GPUs_per_node`. DP is calculated by default; an explicit DP must use all requested GPUs.
+- With EP enabled: `EP = TP * DP`; with EP disabled its group size is 1. vLLM 0.32.0 does not expose an independent arbitrary EP size. `--ep-size` asserts the expected result.
+- A TP*PP replica must fit uniformly within a worker or span a whole number of complete workers. Local DP is calculated automatically.
+- Topology arithmetic and available checkpoint geometry, including attention/o_groups TP divisibility, are checked before submission. Uneven expert placement is permitted without requiring experts % EP == 0.
+- Planning checks cannot guarantee GPU memory capacity or model-kernel support for every combination. Runtime remains stock, without patches. New cluster sizes and parallelism combinations need GPU validation.
+
+[Official EP documentation](https://docs.vllm.ai/en/v0.32.0/serving/expert_parallel_deployment/) · [DP and balancing](https://docs.vllm.ai/en/v0.32.0/serving/data_parallel_deployment/).
+
+### All launcher parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--num-nodes N` | `2` | Positive worker count; automatic platform placement. |
+| `--gpus-per-node N` | `8` | Uniform GPU count per worker, 1..8. |
+| `--allocation-name NAME` | `workspace default` | Target training allocation; no physical host names. |
+| `--queue-name NAME` | `shared` | Target queue; shared is selected explicitly by default. |
+| `--tensor-parallel-size N / --tp N` | `1` | Tensor parallel size for one DP replica. |
+| `--data-parallel-size N / --dp N` | `automatic` | Total GPUs / (TP*PP); an explicit value must satisfy the same equality. |
+| `--pipeline-parallel-size N / --pp N` | `1` | Pipeline parallel stages. |
+| `--data-parallel-size-local N` | `automatic` | Optional assertion of local DP: GPUs/(TP*PP), or 1 for a spanning replica. |
+| `--enable-expert-parallel / --no-enable-expert-parallel` | `enabled` | Enable or disable EP; with EP enabled its size is TP*DP. |
+| `--expert-parallel-size N / --ep-size N` | `automatic` | Optional assertion of the derived EP size; 1 when EP is disabled. |
+| `--model-dir PATH` | `see above` | Complete local DeepSeek V4.1 Flash checkpoint; never downloaded by the launcher. |
+| `--image IMAGE` | `cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42` | Existing worker image; full cr.ai.cloud.ru tag/digest. |
+| `--nfs-root PATH` | `/home/jovyan` | Existing shared directory for run snapshots, keys, logs and status. |
+| `--api-port PORT` | `8000` | API HTTP port in job containers. |
+| `--socket-ifname NAME` | `eth0` | Pod TCP/bootstrap interface; does not select an InfiniBand HCA. |
+| `--served-model-name NAME` | `deepseek-v4.1-flash` | Model identifier exposed by the API. |
+| `--dp-rpc-port PORT` | `13345` | DP coordinator/RPC port; distinct from API and master ports. |
+| `--master-port PORT` | `29501` | Torch rendezvous port for a TP/PP replica spanning workers. |
+| `--max-model-len N` | `vLLM/model default` | Maximum input+output context; runtime/model limits still apply. |
+| `--max-num-seqs N` | `vLLM default` | Maximum concurrent sequences per DP rank. |
+| `--gpu-memory-utilization FLOAT` | `vLLM default` | GPU memory fraction; does not guarantee that weights/KV cache fit. |
+| `--startup-timeout SECONDS` | `3600` | Queue/install/node discovery budget; also used for preflight waits. |
+| `--model-timeout SECONDS` | `3600` | Model loading, JIT and generated-answer readiness budget. |
+| `--serve-minutes MINUTES` | `120` | Serving lease after READY; 720=12h, 1440=24h. |
+| `--dry-run` | `off` | Print resource plan and exact commands; no model reads, files, SDK imports or jobs. |
+| `--prepare-only` | `off` | Validate checkpoint and write a launch snapshot without requesting GPUs. |
+| `--status RUN_DIR` | `—` | Read saved service, platform and all node status files. |
+| `--diagnose RUN_DIR` | `—` | Read saved logs and errors; no platform/GPU work. |
+| `--stop RUN_DIR` | `—` | Write STOP for every supervisor; verify platform jobs actually finish. |
+| `-h / --help` | `—` | Show usage and exit. |
+
+### Results and stopping
+
+Each launch creates a separate directory and snapshots its source. `run.json` stores configuration, `platform-job.json` the job ID/submission reply, and `node-RANK.json`/`stopped-RANK.json` record discovered workers and shutdown. Expect records for all N node ranks. A rejected submission may create no platform job.
+
+`READY.json` follows actual generation and contains topology, `openai_base_url`, `endpoints`, `endpoint_nodes` (MP), lease expiry and the key-file path. The key is in `api-key`, not the report. `--serve-minutes` starts after readiness; returning from the launcher leaves serving GPU processes running.
 
 ```bash
 RUN_DIR=/home/jovyan/cloud-vllm-dep-single-api-ID
+/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Explain expert parallelism." --max-tokens 512
 /usr/bin/python3.12 submit_vllm.py --status "$RUN_DIR"
-/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Explain expert parallelism in three sentences." --max-tokens 512
-
-# Enable reasoning for a separate request.
-/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Solve 3*x + 7 = 22." --thinking --max-tokens 2048
-
-# Inspect startup errors or stop the service on both nodes.
 /usr/bin/python3.12 submit_vllm.py --diagnose "$RUN_DIR"
 /usr/bin/python3.12 submit_vllm.py --stop "$RUN_DIR"
 ```
 
-### Results and API access
-
-`READY.json` records `base_url`, `openai_base_url`, model name and expiry. The generated `api-key` file supplies Bearer authentication. The run directory is a filesystem location for metadata, not a URL. The API runs at the job pod IP, for example `http://10.x.x.x:8000/v1`; `localhost` in Jupyter refers to Jupyter itself.
-
-Each run keeps `run.json`, `node-*.json`, `status-*.json`, `READY.json`, `install-*.log`, `vllm.log`, `nccl.*.log` and `*-error*.json`. The remote-node log is `vllm-worker.log`; exact commands are saved in `server-command-0.json` and `server-command-1.json`. `STOP` requests shutdown; `stopped-*.json` confirms supervisor exit. Keep `api-key` and generated run snapshots out of version control.
-
-### Launch parameters
-
-All options below belong to `submit_vllm.py`. Topology is fixed in this sample. `--status`, `--diagnose` and `--stop` are separate operations; use one per command. Paths used by default:
-
-```text
-BASE_IMAGE=cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42
-MODEL_DIR=/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017
-```
-
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `--model-dir PATH` | `MODEL_DIR` | Local NFS checkpoint directory shown above; must contain config, tokenizer, index and all weight shards. No automatic model download. |
-| `--image IMAGE` | `BASE_IMAGE` | GPU job image shown above: full `cr.ai.cloud.ru` reference with a tag or digest. |
-| `--nodes NODE0 NODE1` | `hpcsrv-201.sr009 hpcsrv-202.sr009` | Two physical hosts, head first; each receives a separate job with eight H200 GPUs. |
-| `--nfs-root PATH` | `/home/jovyan` | Existing shared directory for run snapshots; does not change the checkpoint path. |
-| `--api-port PORT` | `8000` | HTTP port, 1024–65535; the same port is configured on each API node. |
-| `--socket-ifname NAME` | `eth0` | Pod TCP control interface for Gloo/NCCL. NCCL GPU data transport uses InfiniBand. |
-| `--dp-rpc-port PORT` | `13345` | DP coordination port, 1024–65535; must differ from the HTTP port. |
-| `--served-model-name NAME` | `deepseek-v4.1-flash` | Model name exposed through the OpenAI-compatible API. |
-| `--max-model-len TOKENS` | vLLM/model default | Positive total context limit: input plus generated tokens. Omitted for MP unless explicitly set. |
-| `--max-num-seqs N` | vLLM/model default | Positive maximum concurrent sequences per DP engine; not the global HTTP concurrency. |
-| `--gpu-memory-utilization FRACTION` | vLLM/model default | GPU memory budget fraction per engine; `0 < value ≤ 1` when explicitly set. |
-| `--startup-timeout SECONDS` | `3600` | Positive time budget for queueing, environment installation and node preflight. |
-| `--model-timeout SECONDS` | `3600` | Positive time budget for weight loading, compilation and API startup. |
-| `--serve-minutes MINUTES` | `120` | Positive maximum serving lifetime AFTER `READY.json` is created; `720` = 12 hours, `1440` = 24 hours. |
-| `--dry-run` | `false` | Print configuration, resource plan and server command(s); do not read weights, create files or submit jobs. |
-| `--prepare-only` | `false` | Validate the checkpoint and write launch files/API key to NFS without submitting jobs. |
-| `--status RUN_DIR` | — | Print saved status/readiness/errors for an existing run; does not probe the live API. |
-| `--diagnose RUN_DIR` | — | Print saved NFS logs/errors with API-key redaction; creates no jobs. |
-| `--stop RUN_DIR` | — | Write `STOP`; supervisors terminate vLLM on both nodes. |
-| `-h`, `--help` | — | Print command help and exit. |
+| `--run-dir PATH` | `required` | Existing READY run directory. |
+| `--prompt TEXT` | `Briefly explain tensor parallelism.` | English user request text. |
+| `--max-tokens N` | `512` | Maximum response tokens. |
+| `--timeout SECONDS` | `300` | HTTP request timeout. |
+| `--thinking` | `off` | Enable model reasoning. |
+| `-h / --help` | `—` | Show help. |
 
-### Request parameters
+**Stop the service when finished and verify that the Cloud.ru binary job actually ends.** STOP is an NFS request; if supervisors hang, stop the platform job using the ID from `platform-job.json`. Ctrl+C while the launcher is active invokes cleanup. Check every `stopped-RANK.json` and a terminal platform status; Terminating does not yet confirm resource release.
 
-`query_vllm.py` reads the endpoint, model name and API key from the run directory and prints the full JSON response. It uses `/v1/chat/completions`, a fixed temperature of `0.2`, and Python standard-library HTTP without inherited proxies.
+### Versions and validation
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `--run-dir PATH` | Required | Run directory printed by the submit command; must contain an unexpired `READY.json` and `api-key`. |
-| `--prompt TEXT` | `Briefly explain tensor parallelism.` | User message sent to the model. |
-| `--max-tokens N` | `512` | Maximum generated tokens, including reasoning tokens when enabled; must fit the remaining model context. |
-| `--timeout SECONDS` | `300` | HTTP request timeout; does not extend the serving lifetime. |
-| `--thinking` | `false` | Send `chat_template_kwargs.thinking=true`; increase the token budget for reasoning. No reasoning-effort option is exposed. |
-| `-h`, `--help` | — | Print command help and exit. |
-
-### Server configuration
-
-The launcher builds the following vLLM configuration. Values tied to launch parameters are described above; inspect `--dry-run` for the complete command.
-
-| Setting | Value | Purpose |
-| --- | --- | --- |
-| `--tokenizer-mode` | `deepseek_v41` | Model-specific tokenizer mode. |
-| `--tool-call-parser`, `--enable-auto-tool-choice` | `deepseek_v41`, enabled | Parse tool calls and enable automatic tool selection. |
-| `--reasoning-parser` | `deepseek_v41` | Parse model reasoning output. |
-| `--enable-expert-parallel` | enabled | Shard MoE experts across all 16 GPUs. |
-| `--host`, `--port`, `--served-model-name` | `0.0.0.0`, CLI values | Listen on pod interfaces; use the configured HTTP port and model alias. |
-| `--data-parallel-size`, `--data-parallel-size-local` | `16`, `8` | Sixteen DP engines, eight per node; TP=1 and PP=1 use vLLM defaults. |
-| `--data-parallel-address`, `--data-parallel-rpc-port` | head pod IP, `13345` | Shared DP coordination address; RPC port is configurable. |
-| `--mm-encoder-tp-mode` | `data` | Use data mode for the multimodal encoder. |
-| Frontend environment | `VLLM_USE_RUST_FRONTEND=1` | Stock Rust frontend; no runtime source patches. |
-| Optional resource flags | `--max-model-len`, `--max-num-seqs`, `--gpu-memory-utilization` | Passed only when explicitly supplied; otherwise retain vLLM/model defaults. |
-| Node 0 API mode | internal LB | No hybrid-LB or start-rank flag on the head; its API balances all 16 DP engines. |
-| Node 1 flags | `--headless --data-parallel-start-rank 8` | Run the remote DP engines without an HTTP API. |
-
-### Worker entrypoints
-
-The submit script starts these automatically inside jobs; they are not additional getting-started steps. All accept `-h` / `--help`.
-
-| Script | Arguments | Description |
-| --- | --- | --- |
-| `bootstrap_vllm.py` | `--run-dir PATH --rank RANK` | Required: run snapshot; rank `0`, `1` or `auto` (MPI environment). |
-| `vllm_node.py` | `--run-dir PATH --rank 0\|1` | Required: run snapshot and node rank. |
-| `diagnose_vllm.py` | `--run-dir PATH` | Required: existing run; prints saved diagnostics without GPU jobs. |
-
-### Local checks
-
-Run from this directory without GPU jobs or model weights. Tests mock cloud/runtime operations; they do not replace a GPU inference run.
+vLLM 0.32.0, CUDA toolkit 13.0.3. The original two-node preset was exercised on GPUs. The generalized version has local plan/lifecycle tests; this does not validate every topology on hardware. All source comments and messages are in English.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
@@ -141,137 +130,127 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 
 ## Русский
 
-### Что даёт пример
+Один API на узле 0 распределяет запросы между всеми DP-движками; остальные узлы headless.
 
-Поднимает DeepSeek V4.1 Flash (1017) на двух узлах с 16 H200 через штатный multiprocessing vLLM: **TP1 / DP16 / EP16 / PP1**, по восемь DP-движков на узел. MoE-эксперты распределены между всеми 16 GPU. Используются штатный vLLM 0.32.0 и Rust-фронтенд, без патчей исходного кода runtime и без Ray.
+Число узлов, GPU, DP, TP, PP и включение EP настраиваются. Значения по умолчанию сохраняют прежнюю схему: TP1 / DP16 / EP16 / PP1.
 
-**Внутренняя балансировка с одним API:** единственный HTTP API работает на головном узле. Встроенный балансировщик vLLM распределяет запросы между всеми 16 DP-движками, включая движки второго узла, работающего в headless-режиме. Готовность подтверждается сгенерированным ответом и наличием канала NCCL InfiniBand.
+### Требования
 
-Без явно заданных параметров лаунчер сохраняет значения vLLM для контекста, числа последовательностей, памяти, CUDA graphs и бэкендов модели. Для проверенного checkpoint в логе указан максимальный контекст **1 048 576 токенов**; это лимит модели, а не гарантия достаточного KV-кэша для любой нагрузки. Контекст включает вход и выход.
+Запускайте из управляющего Jupyter на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**: именно там доступен **`/usr/bin/python3.12`** и платформенный `client_lib`. Скопируйте каталог примера в общий NFS, например `/home/jovyan/samples`; абсолютные пути должны совпадать в Jupyter и контейнерах задач. Корень запусков должен существовать.
+
+Воркеры используют **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Физические серверы выбирает Cloud.ru: одна binary-задача, `n_workers=N`, `processes_per_worker=1`, без `include_nodes`/`exclude_nodes`. Ранг берётся из MPI; адреса обнаруживаются при запуске. Тип ресурсов — `h200.Ggpu.(12*G)C.(244*G)G`. Доступность типов ресурсов, лимиты аллокации и права очереди проверяет платформа. Ошибка `submit()` выводится сразу; запросы автоматически не повторяются.
+
+Checkpoint по умолчанию:
+
+```text
+/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017
+```
+
+Нужны доступ к загрузке пакетов и InfiniBand для нескольких узлов. Клиент должен видеть IP подов с API; localhost в Jupyter не является адресом API задачи.
 
 ### Состав
 
-- `submit_vllm.py`, `query_vllm.py`: запуск/управление сервисом и авторизованный запрос.
-- `bootstrap_vllm.py`, `vllm_node.py`: установка изолированного runtime, проверка узлов/GPU и управление vLLM.
-- `vllm_common.py`, `cluster_common.py`: проверка весов, команда сервера, окружение, HTTP и задачи Cloud.ru.
-- `diagnose_vllm.py`: извлечение сохранённых ошибок запуска/воркеров, в том числе перемешанных traceback.
-- `requirements-vllm.txt`: версии runtime; `tests/test_dep.py`: локальные тесты запуска и жизненного цикла без облака.
+- Лаунчер, bootstrap и управляющий процесс на каждый узел; `cluster_common.py` и `topology.py` для размещения, обнаружения и проверок.
+- `requirements-*.txt` фиксирует runtime; `tests/` проверяет планы и жизненный цикл без облачных GPU.
+- `vllm_common.py` формирует команды модели; `query_vllm.py` отправляет запросы. Логи, ошибки и готовность сохраняются на NFS.
 
 ### Запуск
-
-Используйте управляющий Jupyter Cloud.ru SR009 на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**. Именно в этом образе доступен **`/usr/bin/python3.12`** и установлен платформенный `client_lib`; нужны два разных узла по восемь H200. По умолчанию указаны `hpcsrv-201.sr009` и `hpcsrv-202.sr009`. Репозиторий и полный checkpoint должны лежать на NFS по одинаковым абсолютным путям в Jupyter и обоих контейнерах задач. Задачам нужны доступ к зависимостям и активный InfiniBand; Jupyter должен иметь сетевой доступ к IP подов задач. Собирать собственный образ не требуется.
 
 ```bash
 cd /home/jovyan/samples/03-vllm-mp-internal-lb
 
-# Посмотреть план без чтения весов и выделения GPU.
-/usr/bin/python3.12 submit_vllm.py --dry-run
-
-# Запустить с проверенными настройками; оставить сервис на 12 часов после готовности.
-/usr/bin/python3.12 submit_vllm.py --serve-minutes 720
+/usr/bin/python3.12 submit_vllm.py --num-nodes 3 --gpus-per-node 8 --tp 1 --dry-run
+/usr/bin/python3.12 submit_vllm.py --num-nodes 3 --gpus-per-node 8 --tp 1 --serve-minutes 720
 ```
 
-Для другого checkpoint или набора узлов добавьте `--model-dir /absolute/path/to/checkpoint --nodes NODE0 NODE1`. `--prepare-only` проверяет веса и создаёт файлы запуска без выделения GPU. Команда выводит прогресс установки/запуска и завершается после первого проверенного ответа; сервис продолжает работать в облачных задачах. Без `--serve-minutes` время работы после готовности составляет два часа.
+Пример десяти узлов, TP2, DP40, EP80:
 
-Ниже замените `ID` точным каталогом, напечатанным командой запуска.
+```bash
+/usr/bin/python3.12 submit_vllm.py \
+  --num-nodes 10 --gpus-per-node 8 \
+  --tp 2 --dp 40 --ep-size 80 \
+  --allocation-name alloc-huawei-rnd-sr009 --queue-name shared \
+  --startup-timeout 7200 --serve-minutes 720 --dry-run
+```
+
+После проверки плана уберите `--dry-run` для отправки. Пример с выключенным EP: `--num-nodes 2 --tp 8 --dp 2 --no-enable-expert-parallel --ep-size 1`. Для TP/PP на нескольких узлах можно проверить план `--num-nodes 4 --tp 8 --pp 2 --dp 2 --dry-run`; совместимость модели должна быть проверена на GPU.
+
+### Правила топологии
+
+- Выделяются одинаковые 1–8 H200 на каждом из N узлов. Число узлов — любое положительное в пределах платформы.
+- `DP * TP * PP = N * GPU_per_node`. DP по умолчанию вычисляется; явно заданный DP должен использовать все запрошенные GPU.
+- При включённом EP: `EP = TP * DP`; при выключенном EP размер группы EP равен 1. Независимый произвольный EP vLLM 0.32.0 не предоставляет. `--ep-size` проверяет ожидаемый размер.
+- Реплика TP*PP должна целиком помещаться в узле с равномерным размещением либо занимать целое число полных узлов. Локальный DP вычисляется автоматически.
+- Перед отправкой проверяются арифметика топологии и доступная геометрия checkpoint, включая TP для attention/o_groups. Разрешённое размещение экспертов не требует делимости числа экспертов на EP.
+- Проверки планирования не гарантируют достаточную память или поддержку каждой комбинации ядрами модели. Runtime остаётся штатным, без патчей. Новые размеры кластера и комбинации нужно проверить на GPU.
+
+[Официальная документация EP](https://docs.vllm.ai/en/v0.32.0/serving/expert_parallel_deployment/) · [DP и балансировка](https://docs.vllm.ai/en/v0.32.0/serving/data_parallel_deployment/).
+
+### Все параметры лаунчера
+
+| Параметр | По умолчанию | Описание |
+| --- | --- | --- |
+| `--num-nodes N` | `2` | Положительное число воркеров; размещение выбирает платформа. |
+| `--gpus-per-node N` | `8` | Одинаковое число GPU на каждом воркере, 1..8. |
+| `--allocation-name NAME` | `workspace default` | Целевая аллокация задач обучения; имена физических узлов не нужны. |
+| `--queue-name NAME` | `shared` | Целевая очередь; по умолчанию явно выбирается shared. |
+| `--tensor-parallel-size N / --tp N` | `1` | Размер тензорного параллелизма одной DP-реплики. |
+| `--data-parallel-size N / --dp N` | `automatic` | Всего GPU / (TP*PP); явно заданное значение должно удовлетворять тому же равенству. |
+| `--pipeline-parallel-size N / --pp N` | `1` | Число стадий конвейерного параллелизма. |
+| `--data-parallel-size-local N` | `automatic` | Необязательная проверка локального DP: GPU/(TP*PP) либо 1 для реплики на нескольких узлах. |
+| `--enable-expert-parallel / --no-enable-expert-parallel` | `enabled` | Включить или выключить EP; при включении размер EP равен TP*DP. |
+| `--expert-parallel-size N / --ep-size N` | `automatic` | Необязательная проверка вычисленного размера EP; при выключенном EP равен 1. |
+| `--model-dir PATH` | `see above` | Полный локальный checkpoint DeepSeek V4.1 Flash; лаунчер веса не скачивает. |
+| `--image IMAGE` | `cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42` | Готовый образ воркеров; полный адрес cr.ai.cloud.ru с тегом/digest. |
+| `--nfs-root PATH` | `/home/jovyan` | Существующий общий каталог для копий запуска, ключей, логов и статусов. |
+| `--api-port PORT` | `8000` | Порт HTTP API в контейнерах задач. |
+| `--socket-ifname NAME` | `eth0` | TCP-интерфейс пода для инициализации; не выбирает InfiniBand HCA. |
+| `--served-model-name NAME` | `deepseek-v4.1-flash` | Идентификатор модели в API. |
+| `--dp-rpc-port PORT` | `13345` | Порт координатора/RPC DP; отличается от API и master-порта. |
+| `--master-port PORT` | `29501` | Порт Torch rendezvous для TP/PP-реплики на нескольких узлах. |
+| `--max-model-len N` | `vLLM/model default` | Максимальный контекст вход+выход; ограничения runtime/модели сохраняются. |
+| `--max-num-seqs N` | `vLLM default` | Максимальное число одновременных последовательностей на DP-ранг. |
+| `--gpu-memory-utilization FLOAT` | `vLLM default` | Доля памяти GPU; не гарантирует, что веса и KV-кеш поместятся. |
+| `--startup-timeout SECONDS` | `3600` | Время на очередь, установку и обнаружение узлов; также используется при проверках. |
+| `--model-timeout SECONDS` | `3600` | Время загрузки модели, JIT и проверки готовности генерацией ответа. |
+| `--serve-minutes MINUTES` | `120` | Срок обслуживания после READY; 720=12ч, 1440=24ч. |
+| `--dry-run` | `off` | Вывести план ресурсов и команды; без чтения модели, файлов, импорта SDK и задач. |
+| `--prepare-only` | `off` | Проверить checkpoint и записать копию запуска без запроса GPU. |
+| `--status RUN_DIR` | `—` | Прочитать сохранённые статусы сервиса, платформы и всех узлов. |
+| `--diagnose RUN_DIR` | `—` | Прочитать логи и ошибки; без запросов платформе/GPU. |
+| `--stop RUN_DIR` | `—` | Записать STOP для всех управляющих процессов; проверить фактическое завершение задач. |
+| `-h / --help` | `—` | Показать справку и выйти. |
+
+### Результаты и остановка
+
+Каждый запуск создаёт отдельный каталог и копирует туда исходники. `run.json` хранит конфигурацию, `platform-job.json` — ID/ответ отправки, `node-RANK.json` и `stopped-RANK.json` — фактические узлы и завершение. Нужны записи для всех N рангов. При ошибке отправки задача может не существовать на платформе.
+
+`READY.json` создаётся после реальной генерации; содержит topology, `openai_base_url`, `endpoints`, `endpoint_nodes` (для MP), срок службы и путь к ключу. Сам ключ находится в `api-key`, не в отчёте. `--serve-minutes` отсчитывается после готовности; после возврата лаунчера модель продолжает занимать GPU.
 
 ```bash
 RUN_DIR=/home/jovyan/cloud-vllm-dep-single-api-ID
+/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Explain expert parallelism." --max-tokens 512
 /usr/bin/python3.12 submit_vllm.py --status "$RUN_DIR"
-/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Explain expert parallelism in three sentences." --max-tokens 512
-
-# Включить рассуждения для отдельного запроса.
-/usr/bin/python3.12 query_vllm.py --run-dir "$RUN_DIR" --prompt "Solve 3*x + 7 = 22." --thinking --max-tokens 2048
-
-# Посмотреть ошибки запуска или остановить сервис на обоих узлах.
 /usr/bin/python3.12 submit_vllm.py --diagnose "$RUN_DIR"
 /usr/bin/python3.12 submit_vllm.py --stop "$RUN_DIR"
 ```
 
-### Результаты и доступ к API
-
-В `READY.json` записываются `base_url`, `openai_base_url`, имя модели и время окончания работы. Созданный файл `api-key` используется для Bearer-авторизации. Каталог запуска — путь к метаданным на диске, а не URL. API работает по IP пода задачи, например `http://10.x.x.x:8000/v1`; `localhost` в Jupyter указывает на сам Jupyter.
-
-Для каждого запуска сохраняются `run.json`, `node-*.json`, `status-*.json`, `READY.json`, `install-*.log`, `vllm.log`, `nccl.*.log` и `*-error*.json`. Лог второго узла — `vllm-worker.log`; точные команды сохраняются в `server-command-0.json` и `server-command-1.json`. `STOP` запрашивает остановку; `stopped-*.json` подтверждают завершение управляющих процессов. Не добавляйте `api-key` и каталоги запусков в систему контроля версий.
-
-### Параметры запуска
-
-Все параметры ниже относятся к `submit_vllm.py`. Топология фиксирована для этого примера. `--status`, `--diagnose` и `--stop` — отдельные операции; указывайте одну на команду. Пути по умолчанию:
-
-```text
-BASE_IMAGE=cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42
-MODEL_DIR=/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017
-```
-
 | Параметр | По умолчанию | Описание |
 | --- | --- | --- |
-| `--model-dir PATH` | `MODEL_DIR` | Каталог весов на NFS указан выше; нужны конфигурация, токенизатор, индекс и все шарды. Автоматической загрузки модели нет. |
-| `--image IMAGE` | `BASE_IMAGE` | Образ GPU-задачи указан выше: полный адрес `cr.ai.cloud.ru` с тегом или digest. |
-| `--nodes NODE0 NODE1` | `hpcsrv-201.sr009 hpcsrv-202.sr009` | Два физических узла, головной — первым; на каждый отправляется отдельная задача с восемью H200. |
-| `--nfs-root PATH` | `/home/jovyan` | Существующий общий каталог для файлов запусков; путь к весам не меняет. |
-| `--api-port PORT` | `8000` | Порт HTTP, 1024–65535; одинаковый на всех узлах с API. |
-| `--socket-ifname NAME` | `eth0` | TCP-интерфейс пода для управления Gloo/NCCL. GPU-данные NCCL передаются через InfiniBand. |
-| `--dp-rpc-port PORT` | `13345` | Порт координации DP, 1024–65535; должен отличаться от порта HTTP. |
-| `--served-model-name NAME` | `deepseek-v4.1-flash` | Имя модели в OpenAI-совместимом API. |
-| `--max-model-len TOKENS` | По умолчанию в vLLM/модели | Положительный лимит полного контекста: вход плюс генерируемые токены. В MP не передаётся без явного указания. |
-| `--max-num-seqs N` | По умолчанию в vLLM/модели | Положительный предел одновременных последовательностей на DP-движок; не глобальный лимит HTTP-запросов. |
-| `--gpu-memory-utilization FRACTION` | По умолчанию в vLLM/модели | Доля памяти GPU для движка; при явном указании `0 < значение ≤ 1`. |
-| `--startup-timeout SECONDS` | `3600` | Положительный лимит времени на очередь, установку окружения и предварительные проверки узлов. |
-| `--model-timeout SECONDS` | `3600` | Положительный лимит времени на загрузку весов, компиляцию и запуск API. |
-| `--serve-minutes MINUTES` | `120` | Положительный лимит работы ПОСЛЕ создания `READY.json`; `720` = 12 часов, `1440` = 24 часа. |
-| `--dry-run` | `false` | Вывести конфигурацию, план ресурсов и команды сервера; не читать веса, не создавать файлы и задачи. |
-| `--prepare-only` | `false` | Проверить веса и записать файлы запуска/API-ключ на NFS без отправки задач. |
-| `--status RUN_DIR` | — | Вывести сохранённые статус, готовность и ошибки запуска; живой API не опрашивается. |
-| `--diagnose RUN_DIR` | — | Вывести логи/ошибки с NFS, скрывая API-ключ; задачи не создаются. |
-| `--stop RUN_DIR` | — | Записать `STOP`; управляющие процессы завершат vLLM на обоих узлах. |
-| `-h`, `--help` | — | Вывести справку и завершиться. |
+| `--run-dir PATH` | `required` | Каталог запуска с READY. |
+| `--prompt TEXT` | `Briefly explain tensor parallelism.` | Текст пользовательского запроса. |
+| `--max-tokens N` | `512` | Максимум токенов ответа. |
+| `--timeout SECONDS` | `300` | Таймаут HTTP-запроса. |
+| `--thinking` | `off` | Включить рассуждение модели. |
+| `-h / --help` | `—` | Показать справку. |
 
-### Параметры запроса
+**После работы обязательно остановите сервис и проверьте завершение binary-задачи в Cloud.ru.** STOP — запрос через NFS; если воркеры зависли, остановите задачу платформы по ID из `platform-job.json`. Ctrl+C во время активного лаунчера включает его очистку. Проверьте `stopped-RANK.json` для всех узлов и конечный статус платформы; Terminating ещё не означает освобождение ресурсов.
 
-`query_vllm.py` читает адрес, имя модели и API-ключ из каталога запуска и выводит полный JSON-ответ. Использует `/v1/chat/completions`, фиксированную температуру `0.2` и HTTP из стандартной библиотеки Python без унаследованных прокси.
+### Версии и проверка
 
-| Параметр | По умолчанию | Описание |
-| --- | --- | --- |
-| `--run-dir PATH` | Обязателен | Каталог, напечатанный командой запуска; нужны актуальный `READY.json` и `api-key`. |
-| `--prompt TEXT` | `Briefly explain tensor parallelism.` | Пользовательское сообщение модели. |
-| `--max-tokens N` | `512` | Максимум генерируемых токенов, включая reasoning при его включении; должен помещаться в оставшийся контекст. |
-| `--timeout SECONDS` | `300` | Таймаут HTTP-запроса; время работы сервиса не продлевает. |
-| `--thinking` | `false` | Передать `chat_template_kwargs.thinking=true`; для рассуждений увеличьте бюджет токенов. Отдельного параметра reasoning effort нет. |
-| `-h`, `--help` | — | Вывести справку и завершиться. |
-
-### Конфигурация сервера
-
-Лаунчер формирует следующую конфигурацию vLLM. Значения, связанные с параметрами запуска, описаны выше; полная команда выводится через `--dry-run`.
-
-| Настройка | Значение | Назначение |
-| --- | --- | --- |
-| `--tokenizer-mode` | `deepseek_v41` | Режим токенизатора модели. |
-| `--tool-call-parser`, `--enable-auto-tool-choice` | `deepseek_v41`, включено | Разбор вызовов инструментов и автоматический выбор инструмента. |
-| `--reasoning-parser` | `deepseek_v41` | Разбор рассуждений модели. |
-| `--enable-expert-parallel` | включено | Распределить MoE-экспертов между всеми 16 GPU. |
-| `--host`, `--port`, `--served-model-name` | `0.0.0.0`, значения CLI | Слушать интерфейсы пода; использовать указанный HTTP-порт и имя модели. |
-| `--data-parallel-size`, `--data-parallel-size-local` | `16`, `8` | Шестнадцать DP-движков, по восемь на узел; TP=1 и PP=1 берутся из значений по умолчанию vLLM. |
-| `--data-parallel-address`, `--data-parallel-rpc-port` | IP головного пода, `13345` | Общий адрес координации DP; порт RPC настраивается. |
-| `--mm-encoder-tp-mode` | `data` | Режим data для мультимодального энкодера. |
-| Frontend environment | `VLLM_USE_RUST_FRONTEND=1` | Штатный Rust-фронтенд; без патчей исходного кода runtime. |
-| Optional resource flags | `--max-model-len`, `--max-num-seqs`, `--gpu-memory-utilization` | Передаются только при явном указании; иначе сохраняются значения по умолчанию vLLM/модели. |
-| Node 0 API mode | internal LB | На головном узле не задаются hybrid-LB и start-rank; его API распределяет запросы между всеми 16 DP-движками. |
-| Node 1 flags | `--headless --data-parallel-start-rank 8` | Запустить удалённые DP-движки без HTTP API. |
-
-### Служебные точки входа
-
-Скрипт отправки запускает их автоматически внутри задач; вручную запускать их для начала работы не требуется. Все поддерживают `-h` / `--help`.
-
-| Скрипт | Аргументы | Описание |
-| --- | --- | --- |
-| `bootstrap_vllm.py` | `--run-dir PATH --rank RANK` | Обязательны: каталог запуска; ранг `0`, `1` или `auto` (из окружения MPI). |
-| `vllm_node.py` | `--run-dir PATH --rank 0\|1` | Обязательны: каталог запуска и ранг узла. |
-| `diagnose_vllm.py` | `--run-dir PATH` | Обязателен каталог существующего запуска; выводит сохранённую диагностику без GPU-задач. |
-
-### Локальные проверки
-
-Запускаются из этого каталога без GPU-задач и весов модели. Тесты имитируют облако/runtime; они не заменяют запуск инференса на GPU.
+vLLM 0.32.0, CUDA toolkit 13.0.3. Исходный пресет на двух узлах ранее проверен на GPU. Новая параметризованная версия проверяется локальными тестами; это не подтверждение работоспособности всех топологий на оборудовании. Все комментарии и сообщения исходного кода — на английском.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 ```
+

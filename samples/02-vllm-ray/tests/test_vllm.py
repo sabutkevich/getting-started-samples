@@ -51,8 +51,9 @@ class DeploymentTests(unittest.TestCase):
             args = arguments(["--model-dir", str(model), "--nfs-root", temp, "--prepare-only"])
             run, jobs = prepare(args)
             config = read_json(run / "run.json")
-            self.assertEqual([job["include_nodes"] for job in jobs], [["hpcsrv-201.sr009"], ["hpcsrv-202.sr009"]])
-            self.assertTrue(all(job["instance_type"] == "h200.8gpu.96C.1952G" and job["n_workers"] == 1 for job in jobs))
+            self.assertEqual(len(jobs), 1)
+            self.assertNotIn("include_nodes", jobs[0])
+            self.assertTrue(all(job["instance_type"] == "h200.8gpu.96C.1952G" and job["n_workers"] == 2 for job in jobs))
             self.assertEqual(config["tensor_parallel_size"] * config["data_parallel_size"], 16)
             self.assertEqual(config["pipeline_parallel_size"], 1)
             self.assertEqual(config["expert_parallel_size"], 16)
@@ -66,7 +67,7 @@ class DeploymentTests(unittest.TestCase):
             for rank, job in enumerate(jobs):
                 command = shlex.split(Path(job["script"]).read_text().splitlines()[-1])
                 self.assertEqual(command[3], str(run / "bootstrap_vllm.py"))
-                self.assertEqual(command[-1], str(rank))
+                self.assertEqual(command[-1], "auto")
             command = server_command(config)
             self.assertEqual(command[2], str(model))
             self.assertIn("--enforce-eager", command)
@@ -180,8 +181,10 @@ class DeploymentTests(unittest.TestCase):
             atomic_json(run / "run.json", {"test_timeout": 10, "model_timeout": 20, "api_port": port,
                                            "served_model_name": "model", "serve_seconds": 30,
                                            "all2all_backend": "allgather_reducescatter",
-                                           "nodes": ["node-a", "node-b"]})
+                                           "num_nodes": 2})
             atomic_json(run / "head.json", {"ip": "127.0.0.1"})
+            for rank in (0, 1):
+                atomic_json(run / f"node-{rank}.json", {"rank": rank, "boot_hash": f"boot-{rank}"})
             (run / "api-key").write_text("secret")
             (run / "nccl.fake.log").write_text("Channel 00: via NET/IB/0/GDRDMA\n")
             (run / "smoke_test.py").write_text("pass\n")

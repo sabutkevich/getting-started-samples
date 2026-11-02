@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch DeepSeek V4.1 Flash on 2 x 8 H200 using existing Cloud.ru containers."""
+"""Launch DeepSeek V4.1 Flash with configurable GPU topology on Cloud.ru."""
 import argparse
 import json
 import re
@@ -10,15 +10,16 @@ import time
 import uuid
 from pathlib import Path
 
+from topology import add_parallel_options, resource_values, topology_from_args, submit_checked
 from cluster_common import BASE_IMAGE, SOURCE_FILES, atomic_json, job_plan, read_json
 from vllm_common import MODEL_PATH, VLLM_FILES, diagnostic_report, inspect_model, server_command, validate_topology
 
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    add_parallel_options(parser, default_tp=8)
     parser.add_argument("--model-dir", default=MODEL_PATH)
     parser.add_argument("--image", default=BASE_IMAGE)
-    parser.add_argument("--nodes", nargs=2, default=["hpcsrv-201.sr009", "hpcsrv-202.sr009"])
     parser.add_argument("--nfs-root", type=Path, default=Path("/home/jovyan"))
     parser.add_argument("--api-port", type=int, default=8000)
     parser.add_argument("--socket-ifname", default="eth0", help="Pod TCP control interface; NCCL data uses InfiniBand")
@@ -48,16 +49,18 @@ def arguments(argv=None):
         parser.error("Lengths, sequence count and time limits must be positive")
     if not 0 < args.gpu_memory_utilization <= 0.95:
         parser.error("--gpu-memory-utilization must be greater than zero and at most 0.95")
+    try:
+        topology_from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
 def prepare(args):
     config = {
         "application": "vllm", "id": uuid.uuid4().hex[:12], "image": args.image,
-        "nodes": args.nodes, "gpus_per_node": 8, "cpus_per_node": 96, "placement": "pinned",
+        **resource_values(args), **topology_from_args(args), "cpus_per_node": 12 * args.gpus_per_node,
         "model_dir": str(Path(args.model_dir).expanduser().absolute()),
-        "tensor_parallel_size": 8, "data_parallel_size": 2, "pipeline_parallel_size": 1,
-        "enable_expert_parallel": True, "expert_parallel_size": 16,
         "all2all_backend": "allgather_reducescatter", "socket_ifname": args.socket_ifname,
         "startup_timeout": args.startup_timeout, "test_timeout": 600,
         "model_timeout": args.model_timeout, "serve_seconds": args.serve_minutes * 60,
@@ -74,7 +77,7 @@ def prepare(args):
                           "server_command": server_command(config),
                           "model_validation": "Deferred: dry-run does not read weights"}, indent=2))
         return None, plan
-    # Fail BEFORE requesting 16 GPUs if the checkpoint is missing or incomplete.
+    # Fail BEFORE requesting GPUs if the checkpoint is missing or incomplete.
     config["model_manifest"] = inspect_model(config["model_dir"])
     config["model_dir"] = config["model_manifest"]["path"]
     validate_topology(config, config["model_manifest"])
@@ -90,7 +93,7 @@ def prepare(args):
     key_file.chmod(0o600)
     for rank, request in enumerate(plan):
         entry = run / f"launch-{rank}.sh"
-        command = ["python", "-u", str(run / "bootstrap_vllm.py"), "--run-dir", str(run), "--rank", str(rank)]
+        command = ["python", "-u", str(run / "bootstrap_vllm.py"), "--run-dir", str(run), "--rank", "auto"]
         entry.write_text("#!/bin/bash\nset -euo pipefail\nexec " + shlex.join(command) + "\n")
         entry.chmod(0o755)
         request["script"] = str(entry)
@@ -99,7 +102,7 @@ def prepare(args):
 
 def status(run):
     report = {"run_dir": str(run)}
-    for name in ("READY.json", "service-exit.json", "status-0.json", "status-1.json", "stopped-0.json", "stopped-1.json"):
+    for name in ("READY.json", "service-exit.json", "platform-job.json", *[path.name for pattern in ("status-*.json", "stopped-*.json") for path in sorted(run.glob(pattern))]):
         value = read_json(run / name)
         if value is not None:
             report[name] = value
@@ -111,7 +114,7 @@ def main(argv=None):
     args = arguments(argv)
     if args.stop:
         (args.stop / "STOP").write_text("vLLM stop requested\n")
-        print("Shutdown requested. Both node supervisors will stop vLLM/Ray.")
+        print("Shutdown requested. All configured node supervisors will stop vLLM/Ray.")
         return
     if args.status:
         status(args.status)
@@ -123,7 +126,10 @@ def main(argv=None):
     if args.dry_run:
         return
     print(f"Run directory: {run}", flush=True)
-    print("Resources: 2 physical nodes x 8 H200 = 16 GPUs. TP=8, DP=2, EP=16, PP=1.", flush=True)
+    config = read_json(run / "run.json")
+    print(f"Resources: {config['num_nodes']} nodes x {config['gpus_per_node']} H200; "
+          f"TP={config['tensor_parallel_size']} DP={config['data_parallel_size']} "
+          f"EP={config['expert_parallel_size']} PP={config['pipeline_parallel_size']}", flush=True)
     if args.prepare_only:
         print(json.dumps(plan, indent=2))
         return
@@ -134,7 +140,7 @@ def main(argv=None):
         for request in plan:
             job = client_lib.Job(**request)
             jobs.append(job)
-            job.submit()
+            submit_checked(job, run)
         print("Waiting for install, Ray/NCCL, weights and first generated response...", flush=True)
         deadline = time.monotonic() + args.startup_timeout + 600 + args.model_timeout
         next_update = 0
@@ -148,7 +154,7 @@ def main(argv=None):
             if time.monotonic() >= deadline:
                 raise TimeoutError("Startup deadline exceeded; check install-*.log / smoke.log / vllm.log")
             if time.monotonic() >= next_update:
-                stages = [read_json(run / f"status-{rank}.json") for rank in (0, 1)]
+                stages = [read_json(run / f"status-{rank}.json") for rank in range(config["num_nodes"])]
                 print("Progress: " + json.dumps(stages), flush=True)
                 next_update = time.monotonic() + 30
             time.sleep(3)
@@ -158,11 +164,15 @@ def main(argv=None):
     except BaseException:
         (run / "STOP").touch()
         for job in jobs:
+            if not getattr(job, "job_name", None):
+                continue
             try:
                 job.kill()
             except Exception as error:
                 print(f"Cleanup: {error}", flush=True)
         for job in jobs:
+            if not getattr(job, "job_name", None):
+                continue
             try:
                 job.logs(tail=80)
             except Exception as error:

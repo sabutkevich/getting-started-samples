@@ -10,16 +10,16 @@ import uuid
 from pathlib import Path
 
 from cluster_common import BASE_IMAGE, SOURCE_FILES, atomic_json, job_plan, read_json
+from topology import add_cluster_options, resource_values, submit_checked
 
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    add_cluster_options(parser)
     parser.add_argument("--image", default=BASE_IMAGE, help="Existing Cloud.ru base image; no custom build needed")
-    parser.add_argument("--nodes", nargs=2, default=["hpcsrv-201.sr009", "hpcsrv-202.sr009"])
     parser.add_argument("--gpus-per-node", type=int, default=1)
     parser.add_argument("--cpus-per-node", type=int, help="Defaults to 12 * GPUs per node")
     parser.add_argument("--nfs-root", type=Path, default=Path("/home/jovyan"))
-    parser.add_argument("--placement", choices=("pinned", "single-job"), default="pinned")
     parser.add_argument("--startup-timeout", type=int, default=900, help="Seconds")
     parser.add_argument("--test-timeout", type=int, default=600, help="Seconds after Ray head is ready")
     parser.add_argument("--keep-alive", action="store_true", help="Keep the cluster after the test")
@@ -43,10 +43,9 @@ def arguments(argv=None):
 
 def prepare(args):
     config = {
-        "id": uuid.uuid4().hex[:12], "image": args.image, "nodes": args.nodes,
+        "id": uuid.uuid4().hex[:12], "image": args.image, **resource_values(args),
         "gpus_per_node": args.gpus_per_node,
         "cpus_per_node": args.cpus_per_node if args.cpus_per_node is not None else 12 * args.gpus_per_node,
-        "placement": args.placement,
         "startup_timeout": args.startup_timeout, "test_timeout": args.test_timeout,
         "keep_seconds": args.keep_minutes * 60 if args.keep_alive else 0,
         "object_store_bytes": 1024**3, "allreduce_mib": 256, "allreduce_iterations": 16,
@@ -64,7 +63,7 @@ def prepare(args):
     config["run_dir"] = str(run)
     atomic_json(run / "run.json", config)
     for index, request in enumerate(plan):
-        rank = str(index) if args.placement == "pinned" else "auto"
+        rank = "auto"
         command = shlex.join(["python", "-u", str(run / "bootstrap_ray.py"),
                               "--run-dir", str(run), "--rank", rank])
         entry = run / f"launch-{index}.sh"
@@ -99,7 +98,7 @@ def main(argv=None):
         for request in plan:
             job = client_lib.Job(**request)
             jobs.append(job)
-            job.submit()
+            submit_checked(job, run)
         print("Waiting for Ray registration, GPU actors, object transfer and NCCL...", flush=True)
         deadline = time.monotonic() + args.startup_timeout + args.test_timeout
         while True:
@@ -121,14 +120,16 @@ def main(argv=None):
         else:
             request_stop(run)
             stop_deadline = time.monotonic() + 90
-            while not all((run / f"stopped-{r}.json").exists() for r in (0, 1)):
+            while not all((run / f"stopped-{r}.json").exists() for r in range(args.num_nodes)):
                 if time.monotonic() >= stop_deadline:
                     raise TimeoutError("Ray test passed but node cleanup did not finish")
                 time.sleep(2)
-            print("Ray stopped on both nodes; binary jobs are finishing.")
+            print("Ray stopped on all configured nodes; binary jobs are finishing.")
     except BaseException:
         request_stop(run)
         for job in jobs:
+            if not getattr(job, "job_name", None):
+                continue
             try:
                 job.kill()
             except Exception as error:
@@ -136,6 +137,8 @@ def main(argv=None):
         raise
     finally:
         for job in jobs:
+            if not getattr(job, "job_name", None):
+                continue
             try:
                 job.logs(tail=60)
             except Exception as error:

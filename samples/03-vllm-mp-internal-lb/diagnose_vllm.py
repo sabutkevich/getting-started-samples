@@ -50,7 +50,7 @@ def failure_report(run):
     except FileNotFoundError:
         key = ""
     sections = []
-    for name in ("vllm.log", "vllm-worker.log"):
+    for name in ("vllm.log", *[p.name for p in sorted(run.glob("vllm-worker*.log"))]):
         path = run / name
         if not path.is_file():
             continue

@@ -10,6 +10,7 @@ import traceback
 from pathlib import Path
 
 from cluster_common import atomic_json, read_json
+from topology import resolved_topology
 from vllm_common import api_request, server_command, stop_process_group
 
 
@@ -19,11 +20,11 @@ def check_cluster(run, config):
     ray.init(address=read_json(run / "head.json")["address"])
     try:
         deadline = time.monotonic() + 120
-        while ray.available_resources().get("GPU", 0) != 16:
+        while ray.available_resources().get("GPU", 0) != config["num_nodes"] * config["gpus_per_node"]:
             if (run / "STOP").exists():
                 raise InterruptedError("Stop requested")
             if time.monotonic() >= deadline:
-                raise TimeoutError("Probe actors did not release all 16 GPU resources")
+                raise TimeoutError("Probe actors did not release all allocated GPU resources")
             time.sleep(1)
     finally:
         ray.shutdown()
@@ -50,6 +51,7 @@ def wait_api(process, base_url, key, model, deadline, stop):
 
 def run_service(run):
     config = read_json(run / "run.json")
+    topo = resolved_topology(config, 8)
     stop = run / "STOP"
     process = smoke = None
     reason = "error"
@@ -68,10 +70,10 @@ def run_service(run):
                 if stop.exists():
                     raise InterruptedError("Stop requested during GPU test")
                 if time.monotonic() > deadline:
-                    raise TimeoutError("16-GPU Ray/NCCL smoke test exceeded time limit")
+                    raise TimeoutError("Configured Ray/NCCL smoke test exceeded time limit")
                 time.sleep(2)
             if smoke.returncode:
-                raise RuntimeError("16-GPU Ray/NCCL smoke test failed; see smoke.log")
+                raise RuntimeError("Configured Ray/NCCL smoke test failed; see smoke.log")
         check_cluster(run, config)
         env = dict(os.environ, VLLM_API_KEY=(run / "api-key").read_text().strip(),
                    HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", VLLM_NO_USAGE_STATS="1")
@@ -93,14 +95,13 @@ def run_service(run):
             # Confirm the data plane actually used InfiniBand during the GPU smoke test.
             nccl_logs = list(run.glob("nccl.*.log"))
             ib = any("via NET/IB/" in path.read_text(errors="replace") for path in nccl_logs)
-            if not ib:
+            if topo["num_nodes"] > 1 and not ib:
                 raise RuntimeError("No NCCL inter-node NET/IB channel found; inspect nccl.*.log")
             ready = {"status": "READY", "completed_at": time.time(),
                      "expires_at": time.time() + config["serve_seconds"], "run_dir": str(run),
                      "base_url": base_url, "openai_base_url": base_url + "/v1",
                      "api_key_file": str(run / "api-key"), "model": config["served_model_name"],
-                     "physical_nodes": config["nodes"], "gpus": 16, "tensor_parallel_size": 8,
-                     "pipeline_parallel_size": 1, "data_parallel_size": 2, "expert_parallel_size": 16,
+                     "physical_nodes": [read_json(run / f"node-{rank}.json")["boot_hash"] for rank in range(topo["num_nodes"])], "gpus": topo["total_gpus"], **topo,
                      "moe_backend": "humming", "all2all_backend": config["all2all_backend"],
                      "nccl_ib_channel_verified_in_gpu_smoke_test": ib,
                      "first_response": response}

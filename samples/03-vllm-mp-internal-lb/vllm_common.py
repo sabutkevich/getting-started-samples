@@ -1,4 +1,6 @@
 """Model, command and HTTP helpers; safe to import in the management Jupyter."""
+from topology import api_nodes, resolved_topology, validate_geometry
+
 import hashlib
 import json
 import os
@@ -10,7 +12,7 @@ from pathlib import Path
 
 VLLM_VERSION = "0.32.0"
 MODEL_PATH = "/home/jovyan/MODELS/deepseek-ai_DeepSeek-V4.1-Flash-1017/deepseek-ai_DeepSeek-V4.1-Flash-1017"
-VLLM_FILES = ("cluster_common.py", "vllm_common.py", "bootstrap_vllm.py", "vllm_node.py", "requirements-vllm.txt", "diagnose_vllm.py")
+VLLM_FILES = ("topology.py", "cluster_common.py", "vllm_common.py", "bootstrap_vllm.py", "vllm_node.py", "requirements-vllm.txt", "diagnose_vllm.py")
 
 
 def tail_log(path, lines=200, max_bytes=64 * 1024):
@@ -36,6 +38,8 @@ def diagnostic_report(run):
                         ("install-0.log", 30), ("install-1.log", 30)):
         if (run / name).exists():
             sections.append(f"{name} (last {lines} lines):\n{tail_log(run / name, lines)}")
+    for path in sorted(run.glob("vllm-worker-*.log")):
+        sections.append(f"{path.name}:\n{tail_log(path)}")
     report = "\n\n".join(sections) or "No error files or logs created yet."
     try:
         key = (run / "api-key").read_text().strip()
@@ -85,36 +89,47 @@ def inspect_model(directory):
 
 
 def validate_model_topology(manifest, config):
-    if (config["tensor_parallel_size"], config["pipeline_parallel_size"],
-        config["data_parallel_size"], config["data_parallel_size_local"],
-        config["enable_expert_parallel"]) != (1, 1, 16, 8, True):
-        raise ValueError("This launcher runs the official two-node DEP recipe: TP1 / PP1 / DP16 / EP16")
+    validate_geometry(manifest, config)
 
 
 def server_command(config, rank, head_ip):
-    # Official DEP model recipe + documented multi-node internal load balancing.
-    if rank not in (0, 1):
-        raise ValueError("Expected node rank 0 or 1")
+    topo = resolved_topology(config)
+    if not 0 <= rank < topo["num_nodes"]:
+        raise ValueError("Node rank is outside the configured worker count")
+    local, span = topo["data_parallel_size_local"], topo["nodes_per_replica"]
+    start = (rank // span) * local
+    hybrid = config.get("load_balancing", 'internal') == "hybrid"
+    is_api = rank in api_nodes(dict(config, load_balancing="hybrid" if hybrid else "internal"))
     command = [
-        "vllm", "serve", config["model_dir"],
-        "--tokenizer-mode", "deepseek_v41", "--enable-expert-parallel",
-        "--data-parallel-size", "16",
-        "--data-parallel-size-local", "8", "--data-parallel-address", head_ip,
+        "vllm", "serve", config["model_dir"], "--tokenizer-mode", "deepseek_v41",
+        "--data-parallel-size", str(topo["data_parallel_size"]),
+        "--data-parallel-size-local", str(local), "--data-parallel-address", head_ip,
         "--data-parallel-rpc-port", str(config["dp_rpc_port"]),
         "--tool-call-parser", "deepseek_v41", "--enable-auto-tool-choice",
         "--reasoning-parser", "deepseek_v41", "--mm-encoder-tp-mode", "data",
         "--host", "0.0.0.0", "--port", str(config["api_port"]),
         "--served-model-name", config["served_model_name"],
     ]
-    if rank == 1:
-        command.extend(["--headless", "--data-parallel-start-rank", "8"])
-    # Head must NOT set start-rank: that would imply hybrid LB in vLLM.
-    # No TP/PP override, eager mode, backend tuning, or model source patches.
-    for key, flag in (("max_model_len", "--max-model-len"),
-                      ("max_num_seqs", "--max-num-seqs"),
+    if topo["enable_expert_parallel"]:
+        command.append("--enable-expert-parallel")
+    if topo["tensor_parallel_size"] != 1:
+        command += ["--tensor-parallel-size", str(topo["tensor_parallel_size"])]
+    if topo["pipeline_parallel_size"] != 1:
+        command += ["--pipeline-parallel-size", str(topo["pipeline_parallel_size"])]
+    if span > 1:
+        command += ["--nnodes", str(topo["num_nodes"]), "--node-rank", str(rank),
+                    "--master-addr", config.get("replica_master_ip", "<REPLICA_LEADER_POD_IP>"),
+                    "--master-port", str(config.get("master_port", 29501)),
+                    "--distributed-executor-backend", "mp", "--data-parallel-backend", "mp"]
+    if not is_api:
+        command += ["--headless", "--data-parallel-start-rank", str(start)]
+    elif hybrid and topo["data_parallel_size"] > local:
+        command += ["--data-parallel-hybrid-lb", "--data-parallel-start-rank", str(start)]
+    # Internal LB head must not set start-rank: that implies hybrid LB.
+    for key, flag in (("max_model_len", "--max-model-len"), ("max_num_seqs", "--max-num-seqs"),
                       ("gpu_memory_utilization", "--gpu-memory-utilization")):
         if config.get(key) is not None:
-            command.extend([flag, str(config[key])])
+            command += [flag, str(config[key])]
     return command
 
 
@@ -131,7 +146,7 @@ def native_environment(config, rank, ip, inherited):
                NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="INIT,NET,GRAPH",
                NCCL_DEBUG_FILE=str(Path(config["run_dir"]) / "nccl.%h.%p.log"),
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", VLLM_NO_USAGE_STATS="1")
-    if rank == 0:
+    if rank in api_nodes(dict(config, load_balancing=config.get("load_balancing", "internal"))):
         env["VLLM_API_KEY"] = (Path(config["run_dir"]) / "api-key").read_text().strip()
     return env
 

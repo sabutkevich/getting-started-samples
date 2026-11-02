@@ -16,7 +16,7 @@ def test_cluster(run):
 
     config = read_json(run / "run.json")
     head = read_json(run / "head.json")
-    metadata = [read_json(run / f"node-{rank}.json") for rank in (0, 1)]
+    metadata = [read_json(run / f"node-{rank}.json") for rank in range(config["num_nodes"])]
     expected_ips = {entry["ip"] for entry in metadata}
     timeout = config["test_timeout"]
     ray.init(address=head["address"], namespace="cloud-ray-" + config["id"])
@@ -28,7 +28,7 @@ def test_cluster(run):
             if {node["NodeManagerAddress"] for node in nodes} == expected_ips:
                 break
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"Expected two Ray nodes at {expected_ips}; got {nodes}")
+                raise TimeoutError(f"Expected all configured Ray nodes at {expected_ips}; got {nodes}")
             time.sleep(2)
         for node in nodes:
             if node["Resources"].get("GPU", 0) != config["gpus_per_node"]:
@@ -74,8 +74,12 @@ def test_cluster(run):
                 x = torch.ones(size // 4, dtype=torch.float32, device="cuda")
                 for _ in range(3):
                     dist.all_reduce(x)
-                # Restore small values after warmup; powers of world stay exactly representable.
+                # Verify nonzero input separately; timed reductions use zeros to avoid overflow.
                 x.fill_(rank + 1)
+                dist.all_reduce(x)
+                expected = world * (world + 1) / 2
+                assert torch.allclose(x, torch.full_like(x, expected), rtol=1e-5, atol=0), "NCCL data check failed"
+                x.zero_()
                 dist.barrier(device_ids=[0])
                 torch.cuda.synchronize()
                 start = time.perf_counter()
@@ -83,8 +87,7 @@ def test_cluster(run):
                     dist.all_reduce(x)
                 torch.cuda.synchronize()
                 elapsed = time.perf_counter() - start
-                expected = world * (world + 1) // 2 * world ** (iterations - 1)
-                assert torch.allclose(x, torch.full_like(x, float(expected)), rtol=1e-5, atol=0), "NCCL AllReduce data check failed"
+                assert bool(torch.all(x == 0).item()), "Timed AllReduce data check failed"
                 return {"rank": rank, "elapsed_seconds": elapsed, "verified": True}
 
             def close(self):
@@ -105,16 +108,20 @@ def test_cluster(run):
             raise RuntimeError("Ray actors were assigned the same physical GPU")
         print("GPU actors:", json.dumps(probes, indent=2), flush=True)
 
-        length = 8 * 1024**2  # 32 MiB; checks Ray's object-manager path in BOTH directions.
-        left, right = actors[0], actors[config["gpus_per_node"]]
+        length = 8 * 1024**2
         transfers = []
-        for producer, consumer in ((left, right), (right, left)):
-            ref = producer.make_payload.remote(length)
-            received = ray.get(consumer.consume_payload.remote(ref), timeout=timeout)
-            if received["length"] != length or received["sum"] != length * (length - 1) // 2:
-                raise RuntimeError("Cross-node Ray object transfer failed")
-            transfers.append(received)
-        print("Ray cross-node object transfers: OK", flush=True)
+        if config["num_nodes"] > 1:
+            # Exercise both directions along a ring connecting all discovered nodes.
+            for node_index in range(config["num_nodes"]):
+                left = actors[node_index * config["gpus_per_node"]]
+                right = actors[((node_index + 1) % config["num_nodes"]) * config["gpus_per_node"]]
+                for producer, consumer in ((left, right), (right, left)):
+                    ref = producer.make_payload.remote(length)
+                    received = ray.get(consumer.consume_payload.remote(ref), timeout=timeout)
+                    if received["length"] != length or received["sum"] != length * (length - 1) // 2:
+                        raise RuntimeError("Cross-node Ray object transfer failed")
+                    transfers.append(received)
+        print(f"Ray object transfers verified: {len(transfers)}", flush=True)
 
         uri = (run / "nccl-store").as_uri()  # unique, previously nonexistent shared-NFS file
         ray.get([actor.init_nccl.remote(uri, rank, len(actors)) for rank, actor in enumerate(actors)], timeout=timeout)
@@ -125,8 +132,8 @@ def test_cluster(run):
         busbw = nccl_bus_bandwidth(size, iterations, elapsed, len(actors))
         report = {
             "status": "PASSED", "completed_at": time.time(),
-            "checks": {"ray_nodes": 2, "gpu_actors": len(actors), "cuda_on_every_gpu": True,
-                       "cross_node_ray_object_transfer_both_directions": True,
+            "checks": {"ray_nodes": config["num_nodes"], "gpu_actors": len(actors), "cuda_on_every_gpu": True,
+                       "cross_node_ray_object_transfer_both_directions": bool(transfers), "object_transfers": transfers,
                        "nccl_allreduce_data_check": True},
             "preflight": metadata, "actors": probes,
             "allreduce": {"buffer_mib": config["allreduce_mib"], "iterations": iterations,
