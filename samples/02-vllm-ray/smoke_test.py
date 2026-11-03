@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 
 from cluster_common import atomic_json, nccl_bus_bandwidth, read_json
+from topology import placement_summary
 
 
 def test_cluster(run):
@@ -152,10 +153,15 @@ def test_cluster(run):
         ep_primitives = None
         if config.get("enable_expert_parallel"):
             ep_primitives = ray.get([actor.gather_scatter.remote() for actor in actors], timeout=timeout)
+        placement = placement_summary(metadata)
         report = {
+            "placement": placement,
             "status": "PASSED", "completed_at": time.time(),
             "checks": {"ray_nodes": config["num_nodes"], "gpu_actors": len(actors), "cuda_on_every_gpu": True,
-                       "cross_node_ray_object_transfer_both_directions": bool(transfers), "object_transfers": transfers,
+                       "cross_node_ray_object_transfer_both_directions": bool(transfers),
+                       "cross_physical_host_ray_object_transfer_both_directions": (
+                           bool(transfers) and placement["cross_physical_host"] is True),
+                       "object_transfers": transfers,
                        "nccl_allreduce_data_check": True},
             "preflight": metadata, "actors": probes,
             "allreduce": {"buffer_mib": config["allreduce_mib"], "iterations": iterations,

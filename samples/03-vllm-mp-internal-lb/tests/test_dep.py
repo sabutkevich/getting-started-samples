@@ -110,13 +110,12 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(env["VLLM_CACHE_ROOT"], "/cache")
                 self.assertEqual("VLLM_API_KEY" in env, rank == 0)
 
-    def test_bad_physical_placement_and_dependency_mismatch_rejected(self):
+    def test_colocated_workers_allowed_but_dependency_or_gpu_overlap_rejected(self):
         left, right = metadata(0), metadata(1)
         validate_peers(left, right)
-        for key, value, message in (("boot_hash", left["boot_hash"], "physical host"),
-                                    ("packages_sha256", "different", "dependencies differ")):
-            with self.assertRaisesRegex(RuntimeError, message):
-                validate_peers(left, dict(right, **{key: value}))
+        validate_peers(left, dict(right, boot_hash=left["boot_hash"]))
+        with self.assertRaisesRegex(RuntimeError, "dependencies differ"):
+            validate_peers(left, dict(right, packages_sha256="different"))
         with self.assertRaisesRegex(RuntimeError, "UUIDs overlap"):
             validate_peers(left, dict(right, devices=left["devices"]))
 

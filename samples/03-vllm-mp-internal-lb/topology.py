@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def add_cluster_options(parser):
-    parser.add_argument("--num-nodes", type=int, default=2, help="Number of automatically placed worker nodes")
+    parser.add_argument("--num-nodes", type=int, default=2, help="Number of automatically placed worker pods; physical servers may be shared")
     parser.add_argument("--allocation-name", help="Cloud.ru training allocation; omitted: workspace default")
     parser.add_argument("--queue-name", default="shared", help="Cloud.ru queue; default: %(default)s")
 
@@ -94,11 +94,10 @@ def validate_geometry(manifest, config, default_tp=1):
 def validate_nodes(metadata, count):
     if sorted(entry["rank"] for entry in metadata) != list(range(count)):
         raise RuntimeError("Worker metadata must contain every configured node rank exactly once")
-    for key, message in (("ip", "Workers share a pod IP"),
-                         ("boot_hash", "Workers share a physical host")):
-        values = [entry.get(key) for entry in metadata if entry.get(key)]
-        if len(values) != len(set(values)):
-            raise RuntimeError(message)
+    # Worker pods may share a physical server when they own different GPUs.
+    ips = [entry["ip"] for entry in metadata]
+    if len(ips) != len(set(ips)):
+        raise RuntimeError("Workers share a pod IP")
     for key in ("ray", "torch", "vllm", "packages_sha256"):
         values = {str(entry[key]) for entry in metadata if key in entry}
         if len(values) > 1:
@@ -107,6 +106,19 @@ def validate_nodes(metadata, count):
              if device.get("uuid") not in (None, "unknown")]
     if len(uuids) != len(set(uuids)):
         raise RuntimeError("GPU UUIDs overlap between processes/nodes")
+
+
+def placement_summary(metadata):
+    """Report worker and physical-host counts without inferring hosts from pod IPs."""
+    hashes = [entry.get("boot_hash") for entry in metadata]
+    count = len(set(hashes)) if all(hashes) else None
+    return {"worker_count": len(metadata), "physical_host_count": count,
+            "cross_physical_host": count > 1 if count is not None else None}
+
+
+def requires_interhost_ib(metadata):
+    """Keep inter-host IB checks strict when physical placement is unknown."""
+    return len(metadata) > 1 and placement_summary(metadata)["physical_host_count"] != 1
 
 
 def wait_nodes(run, config, stop):

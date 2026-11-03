@@ -173,6 +173,20 @@ class DeploymentTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "status 7"):
                 wait_api(process, "http://127.0.0.1:1", "key", "model", time.monotonic() + 10, Path(temp) / "STOP")
 
+    def test_diagnostics_include_failed_gpu_and_installer_on_any_rank(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            (run / "api-key").write_text("secret-key")
+            atomic_json(run / "gpu-preflight-3.json", {"failed_device_index": 5, "error": "CUDA busy secret-key"})
+            (run / "install-3.log").write_text("rank-three-install")
+            from vllm_common import diagnostic_report
+            report = diagnostic_report(run)
+            self.assertIn("gpu-preflight-3.json", report)
+            self.assertIn("failed_device_index", report)
+            self.assertIn("CUDA busy", report)
+            self.assertIn("rank-three-install", report)
+            self.assertNotIn("secret-key", report)
+
     def test_full_service_readiness_generation_and_stop_without_gpu(self):
         # Real subprocess lifecycle; HTTP is stubbed because local sockets are sandboxed.
         with tempfile.TemporaryDirectory() as temp:

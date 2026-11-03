@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 
 from cluster_common import atomic_json, pod_ipv4, read_json, wait_json
-from topology import api_nodes, resolved_topology, wait_nodes
+from topology import api_nodes, resolved_topology, wait_nodes, placement_summary, requires_interhost_ib
 from vllm_common import (VLLM_VERSION, api_request, inspect_model, native_environment,
                          server_command, stop_process_group, validate_model_topology)
 
@@ -55,8 +55,6 @@ def preflight(config, rank):
 def validate_peers(info, peer):
     if info["rank"] == peer["rank"] or info["ip"] == peer["ip"]:
         raise RuntimeError("Expected two distinct node ranks and pod IPs")
-    if info["boot_hash"] and info["boot_hash"] == peer["boot_hash"]:
-        raise RuntimeError("Both jobs are on the same physical host; inspect platform NODES INFO")
     if info["packages_sha256"] != peer["packages_sha256"]:
         raise RuntimeError("Installed dependencies differ between nodes")
     uuids = [d["uuid"] for entry in (info, peer) for d in entry["devices"] if d["uuid"] != "unknown"]
@@ -142,14 +140,15 @@ def serve_node(run, rank):
             apis = [wait_json(run / f"api-ready-{index}.json", max(.001, deadline-time.monotonic()), stop)
                     for index in api_ranks]
             ib = any("via NET/IB/" in path.read_text(errors="replace") for path in run.glob("nccl.*.log"))
-            if config["num_nodes"] > 1 and not ib:
+            if requires_interhost_ib(metadata) and not ib:
                 raise RuntimeError("No vLLM NCCL NET/IB channel found; inspect nccl.*.log")
             ready = {"status": "READY", "completed_at": time.time(),
                      "expires_at": time.time() + config["serve_seconds"], "run_dir": str(run),
                      "base_url": apis[0]["base_url"], "openai_base_url": apis[0]["base_url"] + "/v1",
                      "endpoints": [entry["base_url"] for entry in apis], "endpoint_nodes": api_ranks,
                      "model": config["served_model_name"], "api_key_file": str(run / "api-key"),
-                     "physical_nodes": [entry["boot_hash"] for entry in metadata], "gpus": topo["total_gpus"], **topo,
+                     "physical_nodes": [entry["boot_hash"] for entry in metadata],
+                     "placement": placement_summary(metadata), "gpus": topo["total_gpus"], **topo,
                      "strategy": config["strategy"], "load_balancing": config.get("load_balancing", 'hybrid'),
                      "runtime_patches": [], "launcher": "native-multiprocessing", "frontend": "rust",
                      "vllm_nccl_ib_channel_verified": ib, "first_response": apis[0]["first_response"]}

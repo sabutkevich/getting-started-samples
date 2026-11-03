@@ -14,6 +14,8 @@ Run from the management Jupyter image **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`*
 
 Workers use **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Cloud.ru selects physical hosts: one binary job with `n_workers=N` and `processes_per_worker=1`, without `include_nodes`/`exclude_nodes`. Node ranks come from MPI and addresses are discovered at launch. Resource shape: `h200.Ggpu.(12*G)C.(244*G)G`. The platform enforces available shapes, allocation limits and queue permissions. Rejected submissions fail visibly; there are no automatic submission retries.
 
+**Worker pods and physical servers:** --num-nodes sets the number of worker pods, not distinct physical servers. Cloud.ru may place several workers on one server, as in three workers with two GPUs each on one eight-GPU server. This placement is allowed when pod IPs and allocated GPU UUIDs are distinct. Reports include placement.worker_count and placement.physical_host_count; an unknown host count is null. A successful colocated run verifies communication between worker pods and does not establish communication between physical servers. No physical host names or placement filters are required.
+
 Default checkpoint:
 
 ```text
@@ -148,6 +150,20 @@ vLLM 0.32.0, CUDA toolkit 13.0.3, Ray 2.59.0. The original two-node preset was e
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 ```
 
+
+### CUDA preflight failures
+
+Before checking GPUs, each worker saves `gpu-preflight-RANK.json` in the run directory. It records the pod/IP, PID, visibility variables, driver, GPU UUIDs, compute modes, memory usage and visible compute processes. If CUDA fails, it also records the CUDA device index, failing operation and a second GPU/process snapshot. CUDA and nvidia-smi device indices can differ. Process lists can be restricted by container permissions; an empty list does not prove that no other process uses the GPU.
+
+`CUDA-capable device(s) is/are busy or unavailable` does not identify the cause by itself. Inspect the saved report from the failing worker. It can indicate existing CUDA work, an exclusive/prohibited compute mode, memory pressure or a device/driver access problem. The launcher does not skip the GPU, change compute mode, reset devices or kill unrelated processes. The service has not started if this check fails.
+
+```bash
+RUN_DIR=/home/jovyan/RUN_ID
+cat "$RUN_DIR"/gpu-preflight-*.json
+```
+
+Use the actual run directory printed by the launcher. Reports must be collected in the worker container; running nvidia-smi in Jupyter can inspect a different GPU allocation.
+
 ## Русский
 
 Один API на головном узле; Ray размещает DP-движки и TP/PP-воркеры. Сохранён проверенный текстовый eager-пресет с контекстом 16384, Humming и allgather_reducescatter.
@@ -159,6 +175,8 @@ PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 Запускайте из управляющего Jupyter на образе **`jupyter-cuda13.3-pt2.13.0-gpu:0.0.102`**: именно там доступен **`/usr/bin/python3.12`** и платформенный `client_lib`. Скопируйте каталог примера в общий NFS, например `/home/jovyan/samples`; абсолютные пути должны совпадать в Jupyter и контейнерах задач. Корень запусков должен существовать.
 
 Воркеры используют **`cr.ai.cloud.ru/aicloud-base-images/py3.12-torch2.9.0:0.0.42`**. Физические серверы выбирает Cloud.ru: одна binary-задача, `n_workers=N`, `processes_per_worker=1`, без `include_nodes`/`exclude_nodes`. Ранг берётся из MPI; адреса обнаруживаются при запуске. Тип ресурсов — `h200.Ggpu.(12*G)C.(244*G)G`. Доступность типов ресурсов, лимиты аллокации и права очереди проверяет платформа. Ошибка `submit()` выводится сразу; запросы автоматически не повторяются.
+
+**Воркеры и физические серверы:** --num-nodes задаёт число подов-воркеров, а не различных физических серверов. Cloud.ru может разместить несколько воркеров на одном сервере: например, три воркера по две GPU на сервере с восемью GPU. Такое размещение разрешено, если IP подов и UUID выделенных GPU различаются. В отчётах указаны placement.worker_count и placement.physical_host_count; неизвестное число серверов обозначается null. Успешный запуск на одном сервере подтверждает обмен между подами, но не проверяет связь между физическими серверами. Имена физических узлов и фильтры размещения не нужны.
 
 Checkpoint по умолчанию:
 
@@ -294,3 +312,16 @@ vLLM 0.32.0, CUDA toolkit 13.0.3, Ray 2.59.0. Исходный пресет на
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.12 -m unittest discover -s tests -v
 ```
 
+
+### Ошибки проверки CUDA
+
+До проверки GPU каждый воркер сохраняет `gpu-preflight-RANK.json` в каталоге запуска. В нём указаны под/IP, PID, переменные видимости устройств, драйвер, UUID GPU, compute mode, использование памяти и видимые вычислительные процессы. При ошибке дополнительно сохраняются индекс CUDA-устройства, операция и повторный снимок GPU/процессов. Индексы CUDA и nvidia-smi могут различаться. Видимость процессов может быть ограничена контейнером; пустой список не доказывает отсутствие других процессов на GPU.
+
+Сообщение `CUDA-capable device(s) is/are busy or unavailable` само по себе не определяет причину. Посмотрите отчёт проблемного воркера: он помогает проверить существующую CUDA-нагрузку, exclusive/prohibited compute mode, нехватку памяти или проблему доступа к устройству/драйверу. Лаунчер не пропускает GPU, не меняет compute mode, не сбрасывает устройства и не завершает посторонние процессы. При провале этой проверки сервис ещё не запущен.
+
+```bash
+RUN_DIR=/home/jovyan/RUN_ID
+cat "$RUN_DIR"/gpu-preflight-*.json
+```
+
+Подставьте каталог, напечатанный лаунчером. Снимки собираются внутри воркера; nvidia-smi в Jupyter может показывать другое выделение GPU.

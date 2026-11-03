@@ -32,8 +32,11 @@ def diagnostic_report(run):
     sections = []
     for path in sorted(run.glob("*-error*.json")):
         sections.append(f"{path.name}:\n{tail_log(path)}")
-    for name, lines in (("vllm.log", 200), ("service.log", 40), ("smoke.log", 30),
-                        ("install-0.log", 30), ("install-1.log", 30)):
+    for path in sorted(run.glob("gpu-preflight-*.json")):
+        sections.append(f"{path.name}:\n{tail_log(path, 150)}")
+    for path in sorted(run.glob("install-*.log")):
+        sections.append(f"{path.name} (last 30 lines):\n{tail_log(path, 30)}")
+    for name, lines in (("vllm.log", 200), ("service.log", 40), ("smoke.log", 30)):
         if (run / name).exists():
             sections.append(f"{name} (last {lines} lines):\n{tail_log(run / name, lines)}")
     report = "\n\n".join(sections) or "No error files or logs created yet."

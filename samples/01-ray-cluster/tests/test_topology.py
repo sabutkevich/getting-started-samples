@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from cluster_common import BASE_IMAGE, atomic_json, job_plan, resolve_rank
 from topology import (api_nodes, plan_topology, resolved_topology, submit_checked,
-                      validate_geometry, validate_nodes, wait_nodes)
+                      validate_geometry, validate_nodes, wait_nodes, placement_summary, requires_interhost_ib)
 
 
 class TopologyTests(unittest.TestCase):
@@ -76,7 +76,7 @@ class TopologyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "o_groups=8"):
             validate_geometry(manifest, plan_topology(2, 8, 16))
 
-    def test_all_nodes_are_discovered_in_rank_order_and_same_host_is_rejected(self):
+    def test_all_nodes_are_discovered_in_rank_order_and_colocation_is_allowed(self):
         metadata = [{"rank": rank, "ip": f"10.1.0.{rank+1}", "boot_hash": f"boot-{rank}",
                      "devices": [{"uuid": f"gpu-{rank}"}], "packages_sha256": "same"}
                     for rank in range(5)]
@@ -86,10 +86,30 @@ class TopologyTests(unittest.TestCase):
                 atomic_json(run / f"node-{entry['rank']}.json", entry)
             self.assertEqual(wait_nodes(run, {"num_nodes": 5, "startup_timeout": 1}, run / "STOP"), metadata)
         validate_nodes(metadata, 5)
-        with self.assertRaisesRegex(RuntimeError, "physical host"):
-            validate_nodes([*metadata[:-1], dict(metadata[-1], boot_hash="boot-0")], 5)
+        validate_nodes([*metadata[:-1], dict(metadata[-1], boot_hash="boot-0")], 5)
+        with self.assertRaisesRegex(RuntimeError, "pod IP"):
+            validate_nodes([*metadata[:-1], dict(metadata[-1], ip=metadata[0]["ip"])], 5)
+        with self.assertRaisesRegex(RuntimeError, "UUIDs overlap"):
+            validate_nodes([*metadata[:-1], dict(metadata[-1], devices=metadata[0]["devices"])], 5)
         with self.assertRaisesRegex(RuntimeError, "every configured node"):
             validate_nodes(metadata[:-1], 5)
+
+    def test_three_colocated_workers_have_six_distinct_gpus_and_one_physical_host(self):
+        metadata = [{"rank": rank, "ip": f"10.1.0.{rank+1}", "boot_hash": "server-218",
+                     "devices": [{"uuid": f"gpu-{rank}-{gpu}"} for gpu in range(2)]}
+                    for rank in range(3)]
+        validate_nodes(metadata, 3)
+        self.assertEqual(placement_summary(metadata),
+                         {"worker_count": 3, "physical_host_count": 1, "cross_physical_host": False})
+        self.assertFalse(requires_interhost_ib(metadata))
+        distributed = [*metadata[:-1], dict(metadata[-1], boot_hash="server-219")]
+        self.assertEqual(placement_summary(distributed)["physical_host_count"], 2)
+        self.assertTrue(requires_interhost_ib(distributed))
+        unknown = [dict(entry, boot_hash=None) for entry in metadata]
+        self.assertIsNone(placement_summary(unknown)["physical_host_count"])
+        self.assertTrue(requires_interhost_ib(unknown))
+        with self.assertRaisesRegex(RuntimeError, "UUIDs overlap"):
+            validate_nodes([*metadata[:-1], dict(metadata[-1], devices=metadata[0]["devices"])], 3)
 
     def test_platform_string_error_is_not_treated_as_an_accepted_job(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()):

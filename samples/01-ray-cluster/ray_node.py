@@ -22,45 +22,95 @@ def fingerprint(path):
         return None
 
 
+def gpu_snapshot():
+    """Collect read-only NVML diagnostics without creating CUDA contexts."""
+    commands = {
+        "gpus": ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,name,driver_version,compute_mode,memory.total,memory.used",
+                 "--format=csv,noheader"],
+        "compute_processes": ["nvidia-smi", "--query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory",
+                             "--format=csv,noheader"],
+    }
+    result = {}
+    for name, command in commands.items():
+        try:
+            output = subprocess.run(command, text=True, capture_output=True, timeout=15)
+            result[name] = {"returncode": output.returncode, "stdout": output.stdout[:32768],
+                            "stderr": output.stderr[:4096]}
+        except (OSError, subprocess.SubprocessError) as error:
+            result[name] = {"error": str(error)}
+    return result
+
+
 def preflight(config, rank):
     import ray
     import torch
 
     if ray.__version__ != RAY_VERSION:
         raise RuntimeError(f"Ray {ray.__version__}, expected {RAY_VERSION}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA unavailable: check driver/container compatibility and GPU allocation")
-    count = torch.cuda.device_count()
-    if count != config["gpus_per_node"]:
-        raise RuntimeError(f"Expected {config['gpus_per_node']} visible GPU(s), got {count}")
+    diagnostic_path = Path(config["run_dir"]) / f"gpu-preflight-{rank}.json"
+    info = {"rank": rank, "pod": socket.gethostname(), "ip": pod_ipv4(), "pid": os.getpid(),
+            "boot_hash": fingerprint("/proc/sys/kernel/random/boot_id"),
+            "requested_gpus": config["gpus_per_node"],
+            "torch": torch.__version__, "torch_cuda": torch.version.cuda,
+            "environment": {name: os.environ.get(name) for name in (
+                "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
+                "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "RANK", "LOCAL_RANK")},
+            "index_note": "CUDA indices follow CUDA_VISIBLE_DEVICES; nvidia-smi indices may differ.",
+            "status": "checking", "checks": [], "before_cuda": gpu_snapshot()}
+    atomic_json(diagnostic_path, info)
+    index = None
+    stage = "availability"
     devices = []
-    for index in range(count):
-        with torch.cuda.device(index):
-            x = torch.ones((64, 64), device=f"cuda:{index}")
-            if not bool(torch.all(x @ x == 64).item()):
-                raise RuntimeError("CUDA matmul check failed")
-            torch.cuda.synchronize(index)
-            properties = torch.cuda.get_device_properties(index)
-            devices.append({"index": index, "name": properties.name,
-                            "uuid": str(getattr(properties, "uuid", "unknown"))})
-    command = ["nvidia-smi", "--query-gpu=uuid,driver_version", "--format=csv,noheader"]
     try:
-        driver = subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, timeout=15).strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        driver = f"nvidia-smi unavailable: {error}"
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA unavailable: check driver/container compatibility and GPU allocation")
+        count = torch.cuda.device_count()
+        info["visible_gpus"] = count
+        if count != config["gpus_per_node"]:
+            raise RuntimeError(f"Expected {config['gpus_per_node']} visible GPU(s), got {count}")
+        for index in range(count):
+            stage = "device-context"
+            info.update(current_device_index=index, current_stage=stage)
+            atomic_json(diagnostic_path, info)
+            with torch.cuda.device(index):
+                stage = "matmul"
+                x = torch.ones((64, 64), device=f"cuda:{index}")
+                if not bool(torch.all(x @ x == 64).item()):
+                    raise RuntimeError("CUDA matmul check failed")
+                stage = "synchronize"
+                torch.cuda.synchronize(index)
+                stage = "device-properties"
+                properties = torch.cuda.get_device_properties(index)
+                device = {"index": index, "name": properties.name,
+                          "uuid": str(getattr(properties, "uuid", "unknown"))}
+                devices.append(device)
+                info["checks"].append(dict(device, status="PASSED"))
+        info.update(status="PASSED", current_stage="complete", completed_at=time.time())
+        atomic_json(diagnostic_path, info)
+    except Exception as error:
+        info.update(status="FAILED", failed_device_index=index, failed_stage=stage,
+                    error_type=type(error).__name__, error=str(error), at_failure=gpu_snapshot())
+        atomic_json(diagnostic_path, info)
+        device = f"CUDA device {index}" if index is not None else "CUDA availability/count"
+        raise RuntimeError(
+            f"CUDA preflight failed on rank {rank}, pod {info['pod']}, {device}, stage={stage}: {error}. "
+            f"Read {diagnostic_path} for GPU UUIDs, compute modes, memory and visible GPU processes."
+        ) from error
+    driver = info["before_cuda"]["gpus"].get("stdout", info["before_cuda"]["gpus"].get("error", ""))
     ports = []
     for port in sorted(Path("/sys/class/infiniband").glob("*/ports/*")):
-        info = {"port": str(port)}
+        port_info = {"port": str(port)}
         for name in ("state", "rate", "link_layer"):
             try:
-                info[name] = (port / name).read_text().strip()
+                port_info[name] = (port / name).read_text().strip()
             except OSError:
                 pass
-        ports.append(info)
+        ports.append(port_info)
     return {
         "rank": rank, "pod": socket.gethostname(), "ip": pod_ipv4(),
         "placement": "automatic",
-        "boot_hash": fingerprint("/proc/sys/kernel/random/boot_id"),
+        "boot_hash": info["boot_hash"],
+        "gpu_preflight_file": str(diagnostic_path),
         "python": sys.version, "ray": ray.__version__, "torch": torch.__version__,
         "torch_cuda": torch.version.cuda, "nccl": torch.cuda.nccl.version(),
         "devices": devices, "driver": driver, "rdma_ports": ports,

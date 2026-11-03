@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 
 from cluster_common import atomic_json, read_json
-from topology import resolved_topology
+from topology import resolved_topology, placement_summary, requires_interhost_ib
 from vllm_common import api_request, server_command, stop_process_group
 
 
@@ -95,13 +95,15 @@ def run_service(run):
             # Confirm the data plane actually used InfiniBand during the GPU smoke test.
             nccl_logs = list(run.glob("nccl.*.log"))
             ib = any("via NET/IB/" in path.read_text(errors="replace") for path in nccl_logs)
-            if topo["num_nodes"] > 1 and not ib:
+            metadata = [read_json(run / f"node-{rank}.json") for rank in range(topo["num_nodes"])]
+            if requires_interhost_ib(metadata) and not ib:
                 raise RuntimeError("No NCCL inter-node NET/IB channel found; inspect nccl.*.log")
             ready = {"status": "READY", "completed_at": time.time(),
                      "expires_at": time.time() + config["serve_seconds"], "run_dir": str(run),
                      "base_url": base_url, "openai_base_url": base_url + "/v1",
                      "api_key_file": str(run / "api-key"), "model": config["served_model_name"],
-                     "physical_nodes": [read_json(run / f"node-{rank}.json")["boot_hash"] for rank in range(topo["num_nodes"])], "gpus": topo["total_gpus"], **topo,
+                     "physical_nodes": [entry["boot_hash"] for entry in metadata],
+                     "placement": placement_summary(metadata), "gpus": topo["total_gpus"], **topo,
                      "moe_backend": "humming", "all2all_backend": config["all2all_backend"],
                      "nccl_ib_channel_verified_in_gpu_smoke_test": ib,
                      "first_response": response}
